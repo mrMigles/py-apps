@@ -1,0 +1,4 @@
+python-telegram-bot>=20.0
+yt-dlp
+pytest>=8.0
+pytest-asyncio>=0.23
