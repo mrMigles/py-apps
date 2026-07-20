@@ -136,22 +136,26 @@ CREATE INDEX IF NOT EXISTS messages_unindexed
     WHERE chunk_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS chunks (
-    id               BIGSERIAL    PRIMARY KEY,
-    chat_id          BIGINT       NOT NULL,
-    summary          TEXT         NOT NULL DEFAULT '',
-    keywords         TEXT[]       NOT NULL DEFAULT ARRAY[]::TEXT[],
-    message_ids      BIGINT[]     NOT NULL DEFAULT ARRAY[]::BIGINT[],
-    first_message_id BIGINT,
-    start_date       TIMESTAMPTZ,
-    end_date         TIMESTAMPTZ,
-    embedding        vector({EMBEDDING_DIM}),
-    tsv              tsvector,
-    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    id                     BIGSERIAL    PRIMARY KEY,
+    chat_id                BIGINT       NOT NULL,
+    summary                TEXT         NOT NULL DEFAULT '',
+    keywords               TEXT[]       NOT NULL DEFAULT ARRAY[]::TEXT[],
+    message_ids            BIGINT[]     NOT NULL DEFAULT ARRAY[]::BIGINT[],
+    important_message_ids  BIGINT[]     NOT NULL DEFAULT ARRAY[]::BIGINT[],
+    first_message_id       BIGINT,
+    start_date             TIMESTAMPTZ,
+    end_date               TIMESTAMPTZ,
+    embedding              vector({EMBEDDING_DIM}),
+    tsv                    tsvector,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS chunks_chat_id ON chunks (chat_id);
 CREATE INDEX IF NOT EXISTS chunks_tsv     ON chunks USING GIN (tsv);
 CREATE INDEX IF NOT EXISTS chunks_dates   ON chunks (chat_id, start_date, end_date);
+
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS
+    important_message_ids BIGINT[] NOT NULL DEFAULT ARRAY[]::BIGINT[];
 """
 
 
@@ -254,6 +258,7 @@ async def insert_chunk(
     end_date: Optional[datetime],
     embedding: Optional[List[float]],
     text_for_search: str = "",
+    important_message_ids: Optional[List[int]] = None,
 ) -> int:
     """Insert a finalised chunk and return its new id.
 
@@ -274,18 +279,18 @@ async def insert_chunk(
         cur = await conn.execute(
             """
             INSERT INTO chunks (
-                chat_id, summary, keywords, message_ids,
+                chat_id, summary, keywords, message_ids, important_message_ids,
                 first_message_id, start_date, end_date,
                 embedding, tsv
             ) VALUES (
-                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
                 %s, %s, %s,
                 %s::vector,
                 to_tsvector('russian', %s)
             ) RETURNING id
             """,
             (
-                chat_id, summary, keywords, message_ids,
+                chat_id, summary, keywords, message_ids, important_message_ids or [],
                 first_message_id, start_date, end_date,
                 emb_literal, tsv_source,
             ),

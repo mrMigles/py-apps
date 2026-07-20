@@ -121,6 +121,28 @@ def parse_search_filters(json_str: str) -> dict:
     return result
 
 
+def ensure_citation(
+    answer: str,
+    valid_ids: List[int],
+) -> str:
+    """
+    Guarantee the answer carries at least one [id=N] citation marker.
+
+    Some models produce a well-grounded answer but forget the [id=N] marker
+    convention entirely — in that case convert_id_markers_to_links() has
+    nothing to turn into a link, so the user gets an answer with no source
+    at all. If *answer* has no marker already, append markers for the given
+    *valid_ids* (already ordered by relevance/priority, most important first;
+    at most 3 are appended) so a link always makes it into the final message.
+    """
+    if re.search(r"\[id=\d+\]", answer):
+        return answer
+    if not valid_ids:
+        return answer
+    markers = " ".join(f"[id={mid}]" for mid in valid_ids[:3])
+    return f"{answer} {markers}".strip()
+
+
 def convert_id_markers_to_links(
     text: str,
     link_prefix: Optional[str],
@@ -364,8 +386,11 @@ async def cmd_search(update, context) -> None:
 
         # Build the set of valid citation IDs (canonical: media source if set)
         valid_ids: set = set()
+        canonical_id_by_message_id: dict = {}
         for m in messages:
-            valid_ids.add(m.get("media_source_message_id") or m.get("message_id"))
+            canonical = m.get("media_source_message_id") or m.get("message_id")
+            valid_ids.add(canonical)
+            canonical_id_by_message_id[m.get("message_id")] = canonical
 
         # 6. Generate grounded answer
         try:
@@ -376,6 +401,19 @@ async def cmd_search(update, context) -> None:
             logger.exception("Answer generation failed: %s", exc)
             await processing_msg.edit_text("Не удалось сформировать ответ.")
             return
+
+        # 6b. Guarantee at least one citation, using the chunk's LLM-flagged
+        # important messages first, falling back to the discussion's first
+        # message, so the answer never ends up without a source link.
+        fallback_ids: List[int] = [
+            canonical_id_by_message_id[m]
+            for m in (best.get("important_message_ids") or [])
+            if m in canonical_id_by_message_id
+        ]
+        first_mid_fallback = canonical_id_by_message_id.get(best.get("first_message_id"))
+        if first_mid_fallback and first_mid_fallback not in fallback_ids:
+            fallback_ids.append(first_mid_fallback)
+        raw_answer = ensure_citation(raw_answer, fallback_ids)
 
         # 7. Convert [id=N] markers to validated HTML links
         answer_html = convert_id_markers_to_links(raw_answer, prefix, valid_ids)

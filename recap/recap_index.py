@@ -322,6 +322,7 @@ async def _index_chat(chat_id: int) -> int:
                 end_date=end_date,
                 embedding=embedding,
                 text_for_search=text_for_search,
+                important_message_ids=chunk["important_message_ids"],
             )
             await recap_db.set_chunk_id(chat_id, mids, chunk_id)
             indexed_count += len(mids)

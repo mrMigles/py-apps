@@ -548,6 +548,30 @@ def test_convert_id_markers_multiple():
     assert f'href="{prefix}2"' not in result
 
 
+def test_ensure_citation_adds_marker_when_missing():
+    result = recap_search.ensure_citation("Сергей поделился фото клубники.", [42, 99])
+    assert "[id=42]" in result
+    assert result.startswith("Сергей поделился фото клубники.")
+
+
+def test_ensure_citation_noop_when_marker_present():
+    original = "Сергей поделился фото клубники [id=42]."
+    result = recap_search.ensure_citation(original, [99])
+    assert result == original
+    assert "[id=99]" not in result
+
+
+def test_ensure_citation_noop_when_no_fallback_ids():
+    original = "Ничего не найдено."
+    result = recap_search.ensure_citation(original, [])
+    assert result == original
+
+
+def test_ensure_citation_caps_at_three_markers():
+    result = recap_search.ensure_citation("Текст.", [1, 2, 3, 4, 5])
+    assert result.count("[id=") == 3
+
+
 def test_convert_id_markers_strips_raw_id_list():
     prefix = "https://t.me/c/123/"
     # Some models dump a raw list of message IDs instead of [id=N] markers.
