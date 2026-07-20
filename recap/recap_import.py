@@ -293,6 +293,23 @@ async def _run_import(
             await status_msg.edit_text("Не найдено текстовых сообщений для импорта.")
             return
 
+        if cancel_event.is_set():
+            await status_msg.edit_text("Импорт отменён до начала загрузки.")
+            return
+
+        # Wipe any previously stored history for this chat so the import
+        # produces a clean, fully reindexed history instead of merging with
+        # stale/partial data from an earlier import or from live traffic.
+        await status_msg.edit_text(
+            "Файл прочитан. Удаляю старую историю чата перед повторной индексацией…"
+        )
+        try:
+            await recap_db.wipe_chat(chat_id)
+        except Exception as exc:
+            logger.exception("Failed to wipe chat history for chat_id=%s: %s", chat_id, exc)
+            await status_msg.edit_text(f"Не удалось очистить старую историю: {exc}")
+            return
+
         await status_msg.edit_text(f"Импортирую {total:,} сообщений…")
 
         for i, row in enumerate(rows):
@@ -396,6 +413,8 @@ async def cmd_init(update, context) -> None:
     await msg.reply_text(
         "Пришли файл экспорта Telegram Desktop: result.json, result.json.gz или ZIP-архив. "
         "Экспортировать историю можно через меню чата в приложении Telegram Desktop.\n\n"
+        "⚠️ После загрузки файла вся текущая сохранённая история этого чата будет "
+        "удалена и переиндексирована с нуля.\n\n"
         "Для отмены — /init_cancel."
     )
 

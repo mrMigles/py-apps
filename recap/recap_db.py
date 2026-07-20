@@ -213,6 +213,23 @@ async def upsert_message(row: dict) -> None:
         await conn.execute(_UPSERT_MSG_SQL, row)
 
 
+async def wipe_chat(chat_id: int) -> None:
+    """
+    Permanently delete all stored messages and chunks for one chat.
+
+    Used by /init when a fresh export is uploaded, so the whole history gets
+    cleanly reindexed instead of merging with (possibly stale/partial) data
+    from a previous import or from live traffic.
+    """
+    if not _pool:
+        return
+    async with _pool.connection() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM chunks WHERE chat_id = %s", (chat_id,))
+            await conn.execute("DELETE FROM messages WHERE chat_id = %s", (chat_id,))
+    logger.info("Wiped stored history for chat_id=%s", chat_id)
+
+
 # ---------------------------------------------------------------------------
 # Indexing pipeline helpers
 # ---------------------------------------------------------------------------
