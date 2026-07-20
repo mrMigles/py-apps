@@ -140,7 +140,18 @@ def convert_id_markers_to_links(
             return ""
         return f'<a href="{link_prefix}{mid}">#{mid}</a>'
 
-    return re.sub(r"\[id=(\d+)\]", replace, text)
+    text = re.sub(r"\[id=(\d+)\]", replace, text)
+
+    # Some models ignore the [id=N] convention and instead dump a raw list of
+    # message IDs like "[315950, 315957, ...]". Strip any leftover bracketed
+    # groups that contain only digits, commas and whitespace — they are never
+    # meaningful prose and only leak internal IDs to the user.
+    text = re.sub(r"\[\s*\d[\d,\s]*\]", "", text)
+
+    # Collapse whitespace left behind by removed markers.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r" +([.,;:!?])", r"\1", text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +234,11 @@ def _rerank_sync(chunks: List[dict], query_text: str) -> List[dict]:
 _ANSWER_SYSTEM = (
     "Ты отвечаешь на вопросы по истории Telegram-чата. "
     "Ответ — по-русски, кратко и по делу. "
-    "Ссылайся на источники через маркеры [id=N]. "
+    "Ссылайся на источники, вставляя маркер [id=N] сразу после соответствующего "
+    "факта, где N — id одного сообщения. "
+    "НЕ перечисляй id списком и НЕ выводи id, если по теме ничего не нашлось. "
+    "Если ответа в предоставленных сообщениях нет — просто скажи об этом одним "
+    "предложением без каких-либо id. "
     "Не выдумывай — используй только предоставленные сообщения. "
     "Не генерируй HTML, SQL, Telegram-ссылки или код — только текст с маркерами [id=N]."
 )

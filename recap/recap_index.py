@@ -175,8 +175,9 @@ _CHUNK_USER_TMPL = """\
 Правила:
 - Используй ТОЛЬКО id из этого набора: {valid_ids_preview}
 - Каждое сообщение — ровно в одном блоке, ни одно не пропускай
+- "summary" — одно короткое предложение; "keywords" — не более 5 слов
 - "is_complete": false ТОЛЬКО для последнего блока, если обсуждение явно не завершено
-- Верни ТОЛЬКО JSON-массив, без лишнего текста
+- Верни ТОЛЬКО компактный JSON-массив в ОДНУ строку, без переносов строк, отступов и лишнего текста
 
 Сообщения:
 {conv_text}"""
@@ -209,10 +210,30 @@ def _embed_sync(text: str) -> List[float]:
 # Per-chat indexing
 # ---------------------------------------------------------------------------
 
-async def _index_chat(chat_id: int) -> None:
+def _fallback_chunks(rows: List[dict], window: int = 15) -> List[dict]:
+    """Deterministically split a batch into fixed-size windows.
+
+    Used when the LLM fails to return usable JSON, so the pipeline always makes
+    progress with reasonably-sized (searchable) chunks instead of one giant one.
+    """
+    chunks: List[dict] = []
+    for i in range(0, len(rows), window):
+        group = rows[i:i + window]
+        chunks.append({
+            "message_ids": [r["message_id"] for r in group],
+            "summary": build_index_text(group)[:500],
+            "keywords": [],
+            "important_message_ids": [],
+            "is_complete": True,
+        })
+    return chunks
+
+
+async def _index_chat(chat_id: int) -> int:
+    """Index one batch for a chat. Returns the number of messages indexed."""
     rows = await recap_db.get_unindexed_batch(chat_id, INDEX_BATCH)
     if not rows:
-        return
+        return 0
 
     batch_full = len(rows) >= INDEX_BATCH
     valid_ids: Set[int] = {r["message_id"] for r in rows}
@@ -224,7 +245,7 @@ async def _index_chat(chat_id: int) -> None:
         raw_json = await asyncio.to_thread(_call_chunk_llm_sync, conv_text, valid_ids)
     except Exception as exc:
         logger.exception("Chunk LLM error for chat_id=%s: %s", chat_id, exc)
-        return
+        return 0
 
     chunks = parse_chunk_json(raw_json, valid_ids)
     if not chunks:
@@ -232,19 +253,12 @@ async def _index_chat(chat_id: int) -> None:
         if not batch_full:
             # Small/incomplete backlog: likely a transient LLM hiccup or an
             # ongoing discussion — retry later without forcing a chunk.
-            return
+            return 0
         # Full batch yielded nothing usable (e.g. truncated JSON). Fall back to
-        # a single deterministic chunk so the pipeline always makes progress
+        # deterministic fixed-size windows so the pipeline always makes progress
         # instead of retrying the same batch forever.
-        logger.info("Falling back to a single chunk for chat_id=%s", chat_id)
-        fallback_summary = build_index_text(rows)[:500]
-        chunks = [{
-            "message_ids": [r["message_id"] for r in rows],
-            "summary": fallback_summary,
-            "keywords": [],
-            "important_message_ids": [],
-            "is_complete": True,
-        }]
+        logger.info("Falling back to windowed chunks for chat_id=%s", chat_id)
+        chunks = _fallback_chunks(rows)
 
     # Carry-over: the last chunk may be marked incomplete if the discussion
     # continues beyond this batch.  We skip it so its messages are retried
@@ -262,6 +276,7 @@ async def _index_chat(chat_id: int) -> None:
             # Drop the last incomplete chunk; its messages stay unindexed.
             chunks = chunks[:-1]
 
+    indexed_count = 0
     for chunk in chunks:
         if not chunk["is_complete"]:
             continue
@@ -309,6 +324,7 @@ async def _index_chat(chat_id: int) -> None:
                 text_for_search=text_for_search,
             )
             await recap_db.set_chunk_id(chat_id, mids, chunk_id)
+            indexed_count += len(mids)
             logger.info(
                 "Indexed chunk id=%s for chat_id=%s (%s messages)",
                 chunk_id, chat_id, len(mids),
@@ -318,6 +334,8 @@ async def _index_chat(chat_id: int) -> None:
                 "DB error storing chunk for chat_id=%s: %s", chat_id, exc
             )
 
+    return indexed_count
+
 
 # ---------------------------------------------------------------------------
 # Background loop
@@ -325,26 +343,30 @@ async def _index_chat(chat_id: int) -> None:
 
 async def run_indexer() -> None:
     """
-    Background coroutine: wake every INDEX_INTERVAL seconds, find all chats
-    with unindexed messages, and run the indexing pipeline for each.
+    Background coroutine that keeps chats fully indexed.
+
+    While there is a backlog it processes batches back-to-back (continuous
+    indexing — important during a large /init import), and only sleeps for
+    INDEX_INTERVAL once every chat is fully caught up.
     """
     logger.info(
         "Indexer started (interval=%ss, batch_size=%s)", INDEX_INTERVAL, INDEX_BATCH
     )
     while True:
-        try:
-            await asyncio.sleep(INDEX_INTERVAL)
-        except asyncio.CancelledError:
-            break
-
         if not recap_db.is_enabled():
-            continue
+            try:
+                await asyncio.sleep(INDEX_INTERVAL)
+                continue
+            except asyncio.CancelledError:
+                break
 
+        did_work = False
         try:
             chat_ids = await recap_db.get_chats_with_unindexed()
             for chat_id in chat_ids:
                 try:
-                    await _index_chat(chat_id)
+                    if await _index_chat(chat_id):
+                        did_work = True
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -355,5 +377,13 @@ async def run_indexer() -> None:
             break
         except Exception as exc:
             logger.exception("Indexer loop error: %s", exc)
+            did_work = False
+
+        # Keep draining immediately while progress is being made; otherwise idle
+        # until the next interval. asyncio.sleep(0) yields control between passes.
+        try:
+            await asyncio.sleep(0 if did_work else INDEX_INTERVAL)
+        except asyncio.CancelledError:
+            break
 
     logger.info("Indexer stopped")

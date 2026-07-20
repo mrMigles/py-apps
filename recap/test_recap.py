@@ -546,3 +546,15 @@ def test_convert_id_markers_multiple():
     assert f'href="{prefix}3"' in result
     # id=2 is not in valid_ids
     assert f'href="{prefix}2"' not in result
+
+
+def test_convert_id_markers_strips_raw_id_list():
+    prefix = "https://t.me/c/123/"
+    # Some models dump a raw list of message IDs instead of [id=N] markers.
+    result = recap_search.convert_id_markers_to_links(
+        "Ничего не найдено [315950, 315957, 315958].", prefix, {315950}
+    )
+    assert "315950" not in result
+    assert "315957" not in result
+    assert "[" not in result
+    assert result == "Ничего не найдено."
