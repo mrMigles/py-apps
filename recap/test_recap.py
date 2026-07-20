@@ -1,8 +1,13 @@
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+import recap  # noqa: E402
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
-from recap import recap
 
 
 def message(message_id: int, text: str = "Текст", *, age_hours: int = 0) -> recap.ChatMessage:
@@ -99,3 +104,97 @@ def test_openai_client_requires_token_only_when_used(monkeypatch):
 
     with pytest.raises(RuntimeError, match="OPENAI_TOKEN"):
         recap._get_openai_client()
+
+
+# ----- Image parsing tests -----
+
+def test_media_kind_label_image_description():
+    assert recap._media_kind_label("image_description") == "image description"
+
+
+def test_media_kind_label_other_kinds_unchanged():
+    assert recap._media_kind_label("voice_transcript") == "voice transcript"
+    assert recap._media_kind_label("video_note_transcript") == "video note transcript"
+    assert recap._media_kind_label("text") is None
+
+
+def test_image_model_selection_single(monkeypatch):
+    """Single image should use IMAGE_MODEL_BIG."""
+    monkeypatch.setattr(recap, "IMAGE_MODEL_BIG", "big-model")
+    monkeypatch.setattr(recap, "IMAGE_MODEL_SIMPLE", "simple-model")
+
+    calls = []
+
+    def fake_chat_vision(model, system, prompt_text, image_data_uris, **kwargs):
+        calls.append(model)
+        class _Resp:
+            choices = [type("C", (), {"message": type("M", (), {"content": "описание"})()})()]
+        return _Resp()
+
+    monkeypatch.setattr(recap, "_chat_vision", fake_chat_vision)
+
+    result = recap._describe_images(["data:image/jpeg;base64,AA=="], caption=None)
+    assert calls == ["big-model"]
+    assert result == "описание"
+
+
+def test_image_model_selection_multiple(monkeypatch):
+    """Multiple images should use IMAGE_MODEL_SIMPLE."""
+    monkeypatch.setattr(recap, "IMAGE_MODEL_BIG", "big-model")
+    monkeypatch.setattr(recap, "IMAGE_MODEL_SIMPLE", "simple-model")
+
+    calls = []
+
+    def fake_chat_vision(model, system, prompt_text, image_data_uris, **kwargs):
+        calls.append(model)
+        class _Resp:
+            choices = [type("C", (), {"message": type("M", (), {"content": "описание"})()})()]
+        return _Resp()
+
+    monkeypatch.setattr(recap, "_chat_vision", fake_chat_vision)
+
+    result = recap._describe_images(
+        ["data:image/jpeg;base64,AA==", "data:image/jpeg;base64,BB=="],
+        caption=None,
+    )
+    assert calls == ["simple-model"]
+    assert result == "описание"
+
+
+def test_image_caption_included_in_prompt(monkeypatch):
+    """Caption text should appear in the user prompt sent to the vision model."""
+    monkeypatch.setattr(recap, "IMAGE_MODEL_BIG", "big-model")
+    monkeypatch.setattr(recap, "IMAGE_MODEL_SIMPLE", "simple-model")
+
+    prompts = []
+
+    def fake_chat_vision(model, system, prompt_text, image_data_uris, **kwargs):
+        prompts.append(prompt_text)
+        class _Resp:
+            choices = [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]
+        return _Resp()
+
+    monkeypatch.setattr(recap, "_chat_vision", fake_chat_vision)
+
+    recap._describe_images(["data:image/jpeg;base64,AA=="], caption="тестовая подпись")
+    assert "тестовая подпись" in prompts[0]
+
+
+def test_image_max_cap_in_conversation_text():
+    """image_description messages should appear tagged in conversation output."""
+    img_msg = message(20, "описание котика")
+    img_msg.content_kind = "image_description"
+
+    result = recap._build_conversation_text([img_msg])
+    assert "[image description]" in result
+    assert "описание котика" in result
+
+
+def test_image_stored_text_combines_caption_and_description():
+    """stored_text should be caption + newline + description when caption is present."""
+    caption = "смотри какой кот"
+    description = "рыжий кот лежит на диване"
+    stored = f"{caption}\n{description}"
+
+    assert stored.startswith(caption)
+    assert description in stored

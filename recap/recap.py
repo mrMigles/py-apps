@@ -19,9 +19,12 @@ Env:
 - RECAP_OPENAI_MODEL (optional, default: google/gemini-2.5-flash-lite)
 - RECAP_TRANSCRIPTION_MODEL (optional, default: openai/whisper-large-v3)
 - RECAP_TRANSCRIPTION_LANGUAGE (optional, e.g. ru)
+- RECAP_IMAGE_MODEL_BIG (optional, default: google/gemini-3.1-flash-lite) — for single images
+- RECAP_IMAGE_MODEL_SIMPLE (optional, default: google/gemini-2.5-flash-lite) — for image albums (2–3 photos)
 """
 
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -65,15 +68,34 @@ RECAP_MODEL = os.getenv("RECAP_OPENAI_MODEL", "google/gemini-2.5-flash-lite")
 RECAP_LLM_URL = os.getenv("RECAP_LLM_URL", "https://api.openai.com/v1")
 TRANSCRIPTION_MODEL = os.getenv("RECAP_TRANSCRIPTION_MODEL", "openai/whisper-large-v3")
 TRANSCRIPTION_LANGUAGE = os.getenv("RECAP_TRANSCRIPTION_LANGUAGE")
+IMAGE_MODEL_BIG = os.getenv("RECAP_IMAGE_MODEL_BIG", "google/gemini-3.1-flash-lite")
+IMAGE_MODEL_SIMPLE = os.getenv("RECAP_IMAGE_MODEL_SIMPLE", "google/gemini-2.5-flash-lite")
 
 HISTORY_RETENTION = timedelta(days=1)
 MAX_MESSAGES_FOR_SUMMARY = 250
 MAX_TRANSCRIPT_REPLY_LENGTH = 3600
+MAX_IMAGES_PER_MESSAGE = 3
+MEDIA_GROUP_DEBOUNCE_SECONDS = 2.0
+
+IMAGE_PROMPT = (
+  "Кратко опиши изображение или набор изображений на русском языке. "
+  "Передай только суть: что изображено и в чём основной смысл. "
+  "Для нескольких изображений кратко опиши каждое и затем укажи их общую связь. "
+  "Не переписывай текст целиком, не перечисляй интерфейсные элементы, метрики и незначительные детали. "
+  "Для мема или шутки кратко объясни смысл без подробного разбора. "
+  "Если есть подпись автора — используй её как контекст, но не повторяй дословно. "
+  "Ответ — один короткий абзац, не более 2 предложений и 250 символов. "
+  "Не используй заголовки и списки. Не выдумывай детали."
+)
 
 client: Optional[OpenAI] = None
 
 history_lock = asyncio.Lock()
 chat_history: Dict[int, List["ChatMessage"]] = {}
+
+media_group_lock = asyncio.Lock()
+media_group_buffer: Dict[str, List] = {}
+media_group_tasks: Dict[str, asyncio.Task] = {}
 
 # ==========================
 # Data model
@@ -226,6 +248,8 @@ def _media_kind_label(content_kind: str) -> Optional[str]:
     return "voice transcript"
   if content_kind == "video_note_transcript":
     return "video note transcript"
+  if content_kind == "image_description":
+    return "image description"
   return None
 
 
@@ -381,6 +405,49 @@ def _transcript_reply_text(msg: Message, transcript: str) -> str:
   return _safe_trim(transcript, MAX_TRANSCRIPT_REPLY_LENGTH)
 
 
+async def _download_photo_data_uri(msg: Message) -> str:
+  """Download the largest photo size from a message and return a base64 data URI."""
+  photo = msg.photo[-1]
+  tg_file = await photo.get_file()
+  data = await tg_file.download_as_bytearray()
+  encoded = base64.b64encode(bytes(data)).decode("ascii")
+  return f"data:image/jpeg;base64,{encoded}"
+
+
+def _chat_vision(
+    model: str,
+    system: str,
+    prompt_text: str,
+    image_data_uris: List[str],
+    temperature: float = 0.3,
+    max_tokens: int = 200,
+):
+  content: List[dict] = [{"type": "text", "text": prompt_text}]
+  for uri in image_data_uris:
+    content.append({"type": "image_url", "image_url": {"url": uri}})
+  return _get_openai_client().chat.completions.create(
+      model=model,
+      messages=[
+        {"role": "system", "content": system},
+        {"role": "user", "content": content},
+      ],
+      temperature=temperature,
+      max_tokens=max_tokens,
+  )
+
+
+def _describe_images(data_uris: List[str], caption: Optional[str]) -> str:
+  model = IMAGE_MODEL_BIG if len(data_uris) == 1 else IMAGE_MODEL_SIMPLE
+  user_text = ""
+  if caption:
+    user_text = f"Подпись автора: {caption}\n\n"
+  user_text += "Опиши изображение." if len(data_uris) == 1 else "Опиши набор изображений."
+
+  logger.info("Describing %s image(s) with model=%s", len(data_uris), model)
+  resp = _chat_vision(model, IMAGE_PROMPT, user_text, data_uris)
+  return _safe_trim((resp.choices[0].message.content or "").strip(), 500)
+
+
 def _select_slice_for_recap(chat_id: int, from_message_id: Optional[int]) -> List[ChatMessage]:
   """Return messages for recap: last 24h, optionally starting from given message_id."""
   now = datetime.now(timezone.utc)
@@ -534,6 +601,7 @@ async def _summarize_conversation_narrative(
       "Формат: 2–4 абзаца, цельный рассказ, без списков, добавляя ссылку на сообщение для каждого семантически нового топика.\n"
       "Не цитируй дословно.\n"
       "Строки [voice transcript] и [video note transcript] — это расшифровки голосовых сообщений и кружочков; считай, что это сказал автор строки, а не бот.\n"
+      "Строки [image description] — это автоматическое описание картинок, которые отправил автор; включай их в рассказ как «автор поделился изображением: ...».\n"
       "Отмечай форварды как 'кто-то форварднул ...' если это важно (они помечены как FORWARDED).\n"
       "Укажи, остались ли открытые вопросы/что дальше.\n"
       "Длина: чтобы влезло в одно сообщение Telegram (ориентир до ~1500–1800 символов).\n\n"
@@ -563,6 +631,84 @@ async def _summarize_conversation_narrative(
   except Exception as e:
     logger.exception("OpenAI error: %s", e)
     return "Не получилось обратиться к LLM и сделать рекап."
+
+
+async def _handle_image_group(msgs: List) -> None:
+  """Parse a batch of photo messages (1 or more) and store the result in history."""
+  msgs = sorted(msgs, key=lambda m: m.message_id)
+  capped = msgs[:MAX_IMAGES_PER_MESSAGE]
+  if len(msgs) > MAX_IMAGES_PER_MESSAGE:
+    logger.info(
+        "Image group capped from %s to %s images for msg_id=%s",
+        len(msgs),
+        MAX_IMAGES_PER_MESSAGE,
+        msgs[0].message_id,
+    )
+
+  # Pick caption from whichever message has one
+  caption: Optional[str] = None
+  for m in capped:
+    if m.caption:
+      caption = m.caption.strip()
+      break
+
+  anchor_msg = capped[0]
+  logger.info(
+      "Handling image group: %s image(s), chat_id=%s anchor_msg_id=%s",
+      len(capped),
+      anchor_msg.chat_id,
+      anchor_msg.message_id,
+  )
+
+  try:
+    data_uris = []
+    for m in capped:
+      uri = await _download_photo_data_uri(m)
+      data_uris.append(uri)
+
+    description = await asyncio.to_thread(_describe_images, data_uris, caption)
+  except Exception as e:
+    logger.exception("Image description error: %s", e)
+    return
+
+  if not description:
+    return
+
+  stored_text = f"{caption}\n{description}" if caption else description
+  await _add_to_history(anchor_msg, text_override=stored_text, content_kind="image_description")
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  """Handle incoming photos: buffer album images with debounce, then describe them."""
+  msg = update.effective_message
+  if not msg or not msg.photo:
+    return
+
+  group_id = msg.media_group_id
+
+  if not group_id:
+    # Single photo — process immediately
+    await _handle_image_group([msg])
+    return
+
+  # Album: buffer and debounce
+  async with media_group_lock:
+    media_group_buffer.setdefault(group_id, []).append(msg)
+
+    existing_task = media_group_tasks.get(group_id)
+    if existing_task and not existing_task.done():
+      existing_task.cancel()
+
+    async def _flush(gid: str) -> None:
+      await asyncio.sleep(MEDIA_GROUP_DEBOUNCE_SECONDS)
+      async with media_group_lock:
+        buffered = media_group_buffer.pop(gid, [])
+        media_group_tasks.pop(gid, None)
+      if buffered:
+        await _handle_image_group(buffered)
+
+    task = asyncio.ensure_future(_flush(group_id))
+    media_group_tasks[group_id] = task
 
 
 # ==========================
@@ -723,6 +869,7 @@ def main() -> None:
   application.add_handler(CommandHandler("help", cmd_help))
 
   application.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, on_voice_or_video_note))
+  application.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
   # Store all non-command messages (we'll keep only those with text/caption inside handler)
   application.add_handler(MessageHandler(~filters.COMMAND, on_regular_message))
