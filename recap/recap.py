@@ -12,6 +12,7 @@ Now:
   - message_id must exist in the provided messages set
   - otherwise link is stripped to plain text
 - Forwarded messages are explicitly marked in model input (FORWARDED from ...)
+- Persistent semantic search via PostgreSQL/pgvector (optional)
 
 Env:
 - TELEGRAM_BOT_TOKEN
@@ -21,6 +22,11 @@ Env:
 - RECAP_TRANSCRIPTION_LANGUAGE (optional, e.g. ru)
 - RECAP_IMAGE_MODEL_BIG (optional, default: google/gemini-3.1-flash-lite) — for single images
 - RECAP_IMAGE_MODEL_SIMPLE (optional, default: google/gemini-2.5-flash-lite) — for image albums (2–3 photos)
+- PG_DATABASE, PG_USERNAME, PG_PASSWORD, PG_HOST, PG_PORT — PostgreSQL (optional)
+- RECAP_EMBEDDING_MODEL (optional, default: openai/text-embedding-3-small)
+- RECAP_EMBEDDING_DIM (optional, default: 1536)
+- RECAP_INDEX_INTERVAL_SECONDS (optional, default: 120)
+- RECAP_INDEX_BATCH (optional, default: 250)
 """
 
 import asyncio
@@ -30,7 +36,7 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -44,6 +50,11 @@ from telegram.ext import (
   MessageHandler,
   filters,
 )
+
+import recap_db
+import recap_index
+import recap_search
+import recap_import
 
 # ==========================
 # Logging
@@ -124,10 +135,44 @@ class ChatMessage:
   forward_from_chat_username: Optional[str]
   forward_from_message_id: Optional[int]
 
+  # For voice/video-note transcripts: the original media message id.
+  # In-memory /recap ignores this field.
+  # In DB the row is stored under this id so links point at the media message.
+  media_source_message_id: Optional[int] = field(default=None)
+
 
 # ==========================
 # Helpers
 # ==========================
+
+
+def _cm_to_db_row(cm: "ChatMessage") -> dict:
+  """
+  Convert a ChatMessage to the dict shape expected by recap_db.upsert_message.
+  For transcripts, the DB row is stored under media_source_message_id so that
+  Telegram links point at the original media message.
+  """
+  db_message_id = cm.media_source_message_id if cm.media_source_message_id else cm.message_id
+  return {
+      "chat_id": cm.chat_id,
+      "message_id": db_message_id,
+      "chat_username": cm.chat_username,
+      "user_id": cm.user_id,
+      "user_name": cm.user_name,
+      "text": cm.text,
+      "content_kind": cm.content_kind,
+      "date": cm.date,
+      "is_bot": cm.is_bot,
+      "reply_to_message_id": cm.reply_to_message_id,
+      "reply_to_user_name": cm.reply_to_user_name,
+      "reply_to_text": cm.reply_to_text,
+      "is_forwarded": cm.is_forwarded,
+      "forward_from_name": cm.forward_from_name,
+      "forward_from_chat_title": cm.forward_from_chat_title,
+      "forward_from_chat_username": cm.forward_from_chat_username,
+      "forward_from_message_id": cm.forward_from_message_id,
+      "media_source_message_id": cm.media_source_message_id,
+  }
 
 
 def _get_openai_client() -> OpenAI:
@@ -258,8 +303,9 @@ async def _add_to_history(
     text_override: Optional[str] = None,
     content_kind: str = "text",
     author_msg: Optional[Message] = None,
+    media_source_message_id: Optional[int] = None,
 ) -> None:
-  """Store one message in global in-memory history."""
+  """Store one message in global in-memory history (and enqueue to DB if enabled)."""
   if not msg or not msg.chat:
     logger.info("Skip message without chat: %s", msg)
     return
@@ -310,6 +356,7 @@ async def _add_to_history(
       forward_from_chat_title=fwd_chat_title,
       forward_from_chat_username=fwd_chat_username,
       forward_from_message_id=fwd_msg_id,
+      media_source_message_id=media_source_message_id,
   )
 
   async with history_lock:
@@ -330,6 +377,17 @@ async def _add_to_history(
       len(chat_history[chat_id]),
       before_len - len(chat_history[chat_id]),
       )
+
+  # Enqueue for persistent storage (non-blocking; no effect if PG not configured)
+  if recap_db.is_enabled():
+    q = recap_db.get_write_queue()
+    if q is not None:
+      try:
+        q.put_nowait(_cm_to_db_row(cm))
+      except asyncio.QueueFull:
+        logger.warning("DB write queue is full; dropping message chat_id=%s msg_id=%s", chat_id, cm.message_id)
+      except Exception as exc:
+        logger.exception("Failed to enqueue message for DB: %s", exc)
 
 
 def _telegram_media_suffix(msg: Message) -> str:
@@ -774,6 +832,7 @@ async def on_voice_or_video_note(update: Update, context: ContextTypes.DEFAULT_T
       text_override=transcript,
       content_kind=content_kind,
       author_msg=msg,
+      media_source_message_id=msg.message_id,
   )
 
 
@@ -847,6 +906,52 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ==========================
+# Lifecycle hooks
+# ==========================
+
+
+async def _post_init(application) -> None:
+  """Initialise PostgreSQL pool and start background tasks (if PG is configured)."""
+  await recap_db.init_pool()
+  if recap_db.is_enabled():
+    q = recap_db.get_write_queue()
+    if q is not None:
+      application.bot_data["writer_task"] = asyncio.create_task(
+          recap_db.run_writer(q)
+      )
+      application.bot_data["indexer_task"] = asyncio.create_task(
+          recap_index.run_indexer()
+      )
+      logger.info("DB writer and indexer tasks started")
+  else:
+    logger.info("PostgreSQL not configured — running without persistent storage")
+
+
+async def _post_shutdown(application) -> None:
+  """Stop background tasks and close the DB pool cleanly."""
+  indexer = application.bot_data.get("indexer_task")
+  if indexer:
+    indexer.cancel()
+    try:
+      await asyncio.wait_for(asyncio.shield(indexer), timeout=5.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+      pass
+
+  writer = application.bot_data.get("writer_task")
+  if writer:
+    q = recap_db.get_write_queue()
+    if q is not None:
+      await q.put(None)  # sentinel: tell writer to stop
+    try:
+      await asyncio.wait_for(writer, timeout=10.0)
+    except asyncio.TimeoutError:
+      writer.cancel()
+
+  await recap_db.close_pool()
+  logger.info("DB pool closed")
+
+
+# ==========================
 # Entry point
 # ==========================
 
@@ -858,7 +963,13 @@ def main() -> None:
     raise RuntimeError("OPENAI_TOKEN is not set in environment.")
 
   logger.info("Starting recap bot")
-  application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+  application = (
+      ApplicationBuilder()
+      .token(TELEGRAM_BOT_TOKEN)
+      .post_init(_post_init)
+      .post_shutdown(_post_shutdown)
+      .build()
+  )
 
   application.add_handler(
       MessageHandler(filters.ALL, debug_raw),
@@ -867,9 +978,14 @@ def main() -> None:
 
   application.add_handler(CommandHandler("recap", cmd_recap))
   application.add_handler(CommandHandler("help", cmd_help))
+  application.add_handler(CommandHandler("search", recap_search.cmd_search))
+  application.add_handler(CommandHandler("init", recap_import.cmd_init))
+  application.add_handler(CommandHandler("init_status", recap_import.cmd_init_status))
+  application.add_handler(CommandHandler("init_cancel", recap_import.cmd_init_cancel))
 
   application.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, on_voice_or_video_note))
   application.add_handler(MessageHandler(filters.PHOTO, on_photo))
+  application.add_handler(MessageHandler(filters.Document.ALL, recap_import.on_import_document))
 
   # Store all non-command messages (we'll keep only those with text/caption inside handler)
   application.add_handler(MessageHandler(~filters.COMMAND, on_regular_message))
