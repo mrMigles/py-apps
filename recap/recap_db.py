@@ -252,13 +252,23 @@ async def insert_chunk(
     first_message_id: int,
     start_date: Optional[datetime],
     end_date: Optional[datetime],
-    embedding: List[float],
+    embedding: Optional[List[float]],
+    text_for_search: str = "",
 ) -> int:
-    """Insert a finalised chunk and return its new id."""
+    """Insert a finalised chunk and return its new id.
+
+    The full-text index (tsv) is built from the summary, keywords AND the raw
+    message text so that exact words that appear in messages (but not in the
+    LLM summary) are still lexically searchable. `embedding` may be None — the
+    chunk is then still stored and remains lexically searchable.
+    """
     if not _pool:
         raise RuntimeError("DB pool is not initialised")
 
-    tsv_source = (summary + " " + " ".join(keywords)).strip()
+    tsv_source = " ".join(
+        part for part in (summary, " ".join(keywords), text_for_search) if part
+    ).strip()
+    emb_literal = _vec_str(embedding) if embedding else None
 
     async with _pool.connection() as conn:
         cur = await conn.execute(
@@ -277,7 +287,7 @@ async def insert_chunk(
             (
                 chat_id, summary, keywords, message_ids,
                 first_message_id, start_date, end_date,
-                _vec_str(embedding), tsv_source,
+                emb_literal, tsv_source,
             ),
         )
         row = await cur.fetchone()
@@ -337,7 +347,7 @@ async def hybrid_search(
     if not _pool:
         return []
 
-    base_conditions = ["chat_id = %(chat_id)s", "embedding IS NOT NULL"]
+    base_conditions = ["chat_id = %(chat_id)s"]
     params: dict = {
         "chat_id": chat_id,
         "emb": _vec_str(query_embedding),
@@ -361,6 +371,7 @@ async def hybrid_search(
                ROW_NUMBER() OVER (ORDER BY embedding <=> %(emb)s::vector) AS rn
         FROM   chunks
         WHERE  {where}
+          AND  embedding IS NOT NULL
         LIMIT  %(limit)s
     ),
     lex AS (

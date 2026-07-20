@@ -42,6 +42,7 @@ RECAP_MODEL = os.getenv("RECAP_OPENAI_MODEL", "google/gemini-2.5-flash-lite")
 RECAP_LLM_URL = os.getenv("RECAP_LLM_URL", "https://api.openai.com/v1")
 OPENAI_TOKEN = os.getenv("OPENAI_TOKEN")
 EMBEDDING_MODEL = os.getenv("RECAP_EMBEDDING_MODEL", "openai/text-embedding-3-small")
+LLM_TIMEOUT = float(os.getenv("RECAP_LLM_TIMEOUT_SECONDS", "120"))
 
 _client = None
 
@@ -50,7 +51,9 @@ def _get_client():
     global _client
     if _client is None:
         from openai import OpenAI
-        _client = OpenAI(api_key=OPENAI_TOKEN, base_url=RECAP_LLM_URL)
+        _client = OpenAI(
+            api_key=OPENAI_TOKEN, base_url=RECAP_LLM_URL, timeout=LLM_TIMEOUT
+        )
     return _client
 
 

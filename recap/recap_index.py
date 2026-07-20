@@ -37,7 +37,11 @@ RECAP_LLM_URL = os.getenv("RECAP_LLM_URL", "https://api.openai.com/v1")
 OPENAI_TOKEN = os.getenv("OPENAI_TOKEN")
 EMBEDDING_MODEL = os.getenv("RECAP_EMBEDDING_MODEL", "openai/text-embedding-3-small")
 INDEX_INTERVAL = int(os.getenv("RECAP_INDEX_INTERVAL_SECONDS", "120"))
-INDEX_BATCH = int(os.getenv("RECAP_INDEX_BATCH", "250"))
+# A batch of messages must fit in one LLM response as strict JSON. Keeping this
+# small prevents the response from overflowing max_tokens (which would truncate
+# the JSON, fail parsing and stall the pipeline on the same batch forever).
+INDEX_BATCH = int(os.getenv("RECAP_INDEX_BATCH", "60"))
+LLM_TIMEOUT = float(os.getenv("RECAP_LLM_TIMEOUT_SECONDS", "120"))
 
 _client = None
 
@@ -46,7 +50,9 @@ def _get_client():
     global _client
     if _client is None:
         from openai import OpenAI
-        _client = OpenAI(api_key=OPENAI_TOKEN, base_url=RECAP_LLM_URL)
+        _client = OpenAI(
+            api_key=OPENAI_TOKEN, base_url=RECAP_LLM_URL, timeout=LLM_TIMEOUT
+        )
     return _client
 
 
@@ -189,7 +195,7 @@ def _call_chunk_llm_sync(conv_text: str, valid_ids: Set[int]) -> str:
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.1,
-        max_tokens=3000,
+        max_tokens=8000,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -223,7 +229,22 @@ async def _index_chat(chat_id: int) -> None:
     chunks = parse_chunk_json(raw_json, valid_ids)
     if not chunks:
         logger.warning("No valid chunks from LLM for chat_id=%s", chat_id)
-        return
+        if not batch_full:
+            # Small/incomplete backlog: likely a transient LLM hiccup or an
+            # ongoing discussion — retry later without forcing a chunk.
+            return
+        # Full batch yielded nothing usable (e.g. truncated JSON). Fall back to
+        # a single deterministic chunk so the pipeline always makes progress
+        # instead of retrying the same batch forever.
+        logger.info("Falling back to a single chunk for chat_id=%s", chat_id)
+        fallback_summary = build_index_text(rows)[:500]
+        chunks = [{
+            "message_ids": [r["message_id"] for r in rows],
+            "summary": fallback_summary,
+            "keywords": [],
+            "important_message_ids": [],
+            "is_complete": True,
+        }]
 
     # Carry-over: the last chunk may be marked incomplete if the discussion
     # continues beyond this batch.  We skip it so its messages are retried
@@ -255,14 +276,25 @@ async def _index_chat(chat_id: int) -> None:
         end_date = max(dates) if dates else None
         first_mid = min(mids)
 
-        embed_text = (chunk["summary"] + " " + " ".join(chunk["keywords"])).strip()
+        # Concatenated message text keeps exact words (that may be absent from
+        # the LLM summary) lexically searchable.
+        text_for_search = " ".join(
+            (r.get("text") or "").strip() for r in chunk_rows
+        ).strip()[:8000]
+
+        embed_text = (
+            chunk["summary"] + " " + " ".join(chunk["keywords"]) + " " + text_for_search
+        ).strip()
+        # Embedding failures must NOT stall indexing: store the chunk without an
+        # embedding — it stays lexically searchable and won't be retried forever.
         try:
             embedding = await asyncio.to_thread(_embed_sync, embed_text)
         except Exception as exc:
-            logger.exception(
-                "Embedding error for chunk in chat_id=%s: %s", chat_id, exc
+            logger.warning(
+                "Embedding error for chunk in chat_id=%s (storing without embedding): %s",
+                chat_id, exc,
             )
-            continue
+            embedding = None
 
         try:
             chunk_id = await recap_db.insert_chunk(
@@ -274,6 +306,7 @@ async def _index_chat(chat_id: int) -> None:
                 start_date=start_date,
                 end_date=end_date,
                 embedding=embedding,
+                text_for_search=text_for_search,
             )
             await recap_db.set_chunk_id(chat_id, mids, chunk_id)
             logger.info(
