@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -510,6 +511,16 @@ def test_parse_search_filters_markdown_fence():
     assert f["query"] == "тест"
 
 
+def test_extract_cited_ids_order_and_dedup():
+    text = "Смотри [id=5] и [id=2], а еще раз [id=5] и [id=999]."
+    result = recap_search.extract_cited_ids(text, {2, 5})
+    assert result == [5, 2]
+
+
+def test_extract_cited_ids_no_markers():
+    assert recap_search.extract_cited_ids("Ничего не найдено.", {1, 2}) == []
+
+
 def test_convert_id_markers_to_links_known_id():
     prefix = "https://t.me/c/123/"
     result = recap_search.convert_id_markers_to_links(
@@ -529,12 +540,13 @@ def test_convert_id_markers_drops_unknown_id():
 
 
 def test_convert_id_markers_no_prefix():
-    """Without a link prefix, markers are removed (no stable links)."""
+    """Without a link prefix, markers become plain-text "(#N)" references."""
     result = recap_search.convert_id_markers_to_links(
         "смотри [id=5] вот", None, {5}
     )
     assert "[id=5]" not in result
     assert "href" not in result
+    assert "(#5)" in result
 
 
 def test_convert_id_markers_multiple():
@@ -582,3 +594,80 @@ def test_convert_id_markers_strips_raw_id_list():
     assert "315957" not in result
     assert "[" not in result
     assert result == "Ничего не найдено."
+
+
+class _FakeMessage:
+    def __init__(self):
+        self.edit_text = AsyncMock()
+        self.delete = AsyncMock()
+
+
+class _FakeChat:
+    def __init__(self, chat_id, username=None):
+        self.id = chat_id
+        self.username = username
+
+
+@pytest.mark.asyncio
+async def test_search_never_trades_off_reply_against_citation(monkeypatch):
+    """
+    /search must never trade the reply off against the citation link: even
+    when the first reply-target candidate fails (e.g. an imported message
+    that no longer exists live), it must retry the next candidate AND the
+    sent text must keep carrying the citation/link — reply and citation are
+    independent mechanisms, never alternatives to each other.
+    """
+    chat_id = -100999
+    monkeypatch.setattr(recap_db, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        recap_search, "_normalise_query_sync", lambda q: json.dumps({"query": q})
+    )
+    monkeypatch.setattr(recap_search, "_embed_sync", lambda text: [0.1, 0.2])
+
+    chunk = {
+        "id": 1,
+        "message_ids": [10, 11],
+        "important_message_ids": [10],
+        "first_message_id": 10,
+        "summary": "тест",
+    }
+    monkeypatch.setattr(recap_db, "hybrid_search", AsyncMock(return_value=[chunk]))
+
+    messages = [
+        {"message_id": 10, "media_source_message_id": None, "user_name": "Иван", "text": "первое"},
+        {"message_id": 11, "media_source_message_id": None, "user_name": "Пётр", "text": "второе"},
+    ]
+    monkeypatch.setattr(recap_db, "get_chunk_messages", AsyncMock(return_value=messages))
+
+    # The LLM "forgets" the [id=N] marker convention entirely — ensure_citation
+    # must inject a fallback citation from the chunk's important_message_ids.
+    monkeypatch.setattr(
+        recap_search, "_generate_answer_sync",
+        lambda messages, query: "Нашёл ответ без маркера.",
+    )
+
+    processing_msg = _FakeMessage()
+    update = MagicMock()
+    update.effective_message.reply_text = AsyncMock(return_value=processing_msg)
+    update.effective_chat = _FakeChat(chat_id, username=None)
+
+    context = MagicMock()
+    context.args = ["тест"]
+    # First candidate (message_id=10) fails exactly like Telegram's real
+    # "Message to be replied not found"; the second candidate (message_id=11)
+    # must then be tried and succeed.
+    context.bot.send_message = AsyncMock(
+        side_effect=[Exception("Message to be replied not found"), None]
+    )
+
+    await recap_search.cmd_search(update, context)
+
+    assert context.bot.send_message.call_count == 2
+    first_call, second_call = context.bot.send_message.call_args_list
+    assert first_call.kwargs["reply_to_message_id"] == 10
+    assert second_call.kwargs["reply_to_message_id"] == 11
+    # Both attempts carry the exact same citation-bearing text — the citation
+    # never depends on whether the reply attempt itself succeeds.
+    assert first_call.kwargs["text"] == second_call.kwargs["text"]
+    assert "#10" in second_call.kwargs["text"]
+    assert 'href="https://t.me/c/999/10"' in second_call.kwargs["text"]

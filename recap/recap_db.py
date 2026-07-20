@@ -40,6 +40,7 @@ EMBEDDING_DIM = int(os.getenv("RECAP_EMBEDDING_DIM", "1536"))
 
 _pool = None  # set by init_pool()
 _write_queue: Optional[asyncio.Queue] = None
+_wake_event: Optional[asyncio.Event] = None
 
 
 def is_enabled() -> bool:
@@ -53,7 +54,7 @@ def is_enabled() -> bool:
 
 async def init_pool() -> None:
     """Open the async connection pool and bootstrap the database schema."""
-    global _pool, _write_queue
+    global _pool, _write_queue, _wake_event
     if not is_enabled():
         return
 
@@ -82,6 +83,7 @@ async def init_pool() -> None:
     )
     await _pool.open()
     _write_queue = asyncio.Queue()
+    _wake_event = asyncio.Event()
 
     await _bootstrap_schema()
     logger.info(
@@ -99,6 +101,21 @@ async def close_pool() -> None:
 
 def get_write_queue() -> Optional[asyncio.Queue]:
     return _write_queue
+
+
+def get_wake_event() -> Optional[asyncio.Event]:
+    """
+    Event the indexer waits on while idle. Set by wake_indexer() whenever a
+    message is written, so a fresh live message or /init upload is picked up
+    immediately instead of waiting out the full INDEX_INTERVAL.
+    """
+    return _wake_event
+
+
+def wake_indexer() -> None:
+    """Signal the indexer to stop waiting and run another pass right away."""
+    if _wake_event is not None:
+        _wake_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +228,7 @@ async def upsert_message(row: dict) -> None:
         return
     async with _pool.connection() as conn:
         await conn.execute(_UPSERT_MSG_SQL, row)
+    wake_indexer()
 
 
 async def wipe_chat(chat_id: int) -> None:

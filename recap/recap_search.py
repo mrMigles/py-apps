@@ -14,9 +14,12 @@ Flow:
   6. Load the best chunk's original messages from DB.
   7. LLM generates a grounded answer using only [id=N] markers (no HTML,
      no SQL, no Telegram links).
-  8. Application converts [id=N] markers to validated HTML links
-     (unknown IDs are silently dropped).
-  9. Reply to the first message of the selected discussion.
+  8. Application converts [id=N] markers to validated HTML links, or to
+     plain-text "(#N)" references when the chat has no stable permalink
+     format (e.g. a basic, non-super group); unknown IDs are dropped.
+  9. Reply to the message the answer actually cites (falling back through
+     important/first/any chunk message) — old imported messages may no
+     longer exist in the live chat, so several candidates are tried.
 
 Pure helpers (parse_search_filters, convert_id_markers_to_links) have no
 I/O and can be unit-tested without a database or LLM.
@@ -143,6 +146,25 @@ def ensure_citation(
     return f"{answer} {markers}".strip()
 
 
+def extract_cited_ids(text: str, valid_ids: set) -> List[int]:
+    """
+    Return the [id=N] message ids cited in *text*, in order of first
+    appearance, deduplicated and restricted to valid_ids.
+
+    Used to pick reply-to-message targets that the answer actually grounds
+    itself in — more relevant than always using the chunk's chronologically
+    first message, which may since have been deleted from the live chat.
+    """
+    seen = set()
+    ids: List[int] = []
+    for m in re.finditer(r"\[id=(\d+)\]", text):
+        mid = int(m.group(1))
+        if mid in valid_ids and mid not in seen:
+            seen.add(mid)
+            ids.append(mid)
+    return ids
+
+
 def convert_id_markers_to_links(
     text: str,
     link_prefix: Optional[str],
@@ -153,13 +175,19 @@ def convert_id_markers_to_links(
 
     Rules:
     - ID must be in valid_ids, otherwise the marker is removed entirely.
-    - If link_prefix is None (no stable permalink), the marker is removed too.
+    - If link_prefix is None (no stable permalink exists for this chat — e.g.
+      a basic, non-super group has no t.me/c/... URL scheme at all), the
+      marker becomes a plain-text "(#N)" reference instead of a link, so the
+      answer still shows *something* traceable rather than silently losing
+      every citation.
     - The generated href is: link_prefix + str(id)
     """
     def replace(m: re.Match) -> str:
         mid = int(m.group(1))
-        if mid not in valid_ids or not link_prefix:
+        if mid not in valid_ids:
             return ""
+        if not link_prefix:
+            return f"(#{mid})"
         return f'<a href="{link_prefix}{mid}">#{mid}</a>'
 
     text = re.sub(r"\[id=(\d+)\]", replace, text)
@@ -415,34 +443,66 @@ async def cmd_search(update, context) -> None:
             fallback_ids.append(first_mid_fallback)
         raw_answer = ensure_citation(raw_answer, fallback_ids)
 
-        # 7. Convert [id=N] markers to validated HTML links
+        # 7. Reply-to candidates: the ids the answer actually cites (most
+        # relevant), then the fallback ids, then the chunk's first message,
+        # then any other message in the chunk — tried in this order below
+        # since imported/historical messages can be missing from the live
+        # chat (deleted, or the chat never actually reaches back that far).
+        cited_ids = extract_cited_ids(raw_answer, valid_ids)
+        first_mid_canonical = canonical_id_by_message_id.get(best.get("first_message_id"))
+        reply_candidates: List[int] = []
+        seen_candidates: set = set()
+
+        def _add_candidate(mid: Optional[int]) -> None:
+            if mid and mid not in seen_candidates:
+                seen_candidates.add(mid)
+                reply_candidates.append(mid)
+
+        for mid in cited_ids:
+            _add_candidate(mid)
+        for mid in fallback_ids:
+            _add_candidate(mid)
+        _add_candidate(first_mid_canonical)
+        for m in messages:
+            _add_candidate(m.get("media_source_message_id") or m.get("message_id"))
+
+        # 8. Convert [id=N] markers to validated HTML links (or plain-text
+        # "(#N)" references when this chat has no stable permalink format).
         answer_html = convert_id_markers_to_links(raw_answer, prefix, valid_ids)
         answer_html = answer_html.strip() or "Ответ не сформирован."
 
-        # 8. Delete "Ищу…" message and send the answer
+        # 9. Delete "Ищу…" message and send the answer
         try:
             await processing_msg.delete()
         except Exception:
             pass
 
-        first_mid = best.get("first_message_id")
         send_kwargs = dict(
             chat_id=chat_id,
             text=answer_html,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        if first_mid:
-            send_kwargs["reply_to_message_id"] = first_mid
 
-        try:
-            await context.bot.send_message(**send_kwargs)
-        except Exception as exc:
-            logger.warning(
-                "Could not send reply to message_id=%s (%s); sending without reply",
-                first_mid, exc,
-            )
-            send_kwargs.pop("reply_to_message_id", None)
+        sent = False
+        for candidate in reply_candidates[:6]:
+            try:
+                await context.bot.send_message(reply_to_message_id=candidate, **send_kwargs)
+                sent = True
+                break
+            except Exception as exc:
+                logger.debug(
+                    "Reply to message_id=%s failed (%s); trying next candidate",
+                    candidate, exc,
+                )
+
+        if not sent:
+            if reply_candidates:
+                logger.warning(
+                    "Could not reply to any of %s candidate messages for chat_id=%s; "
+                    "sending without reply",
+                    len(reply_candidates[:6]), chat_id,
+                )
             await context.bot.send_message(**send_kwargs)
 
     except Exception as exc:

@@ -236,6 +236,10 @@ async def _index_chat(chat_id: int) -> int:
         return 0
 
     batch_full = len(rows) >= INDEX_BATCH
+    logger.info(
+        "Indexing batch of %s messages for chat_id=%s (batch_full=%s)",
+        len(rows), chat_id, batch_full,
+    )
     valid_ids: Set[int] = {r["message_id"] for r in rows}
     id_to_row = {r["message_id"]: r for r in rows}
 
@@ -347,8 +351,11 @@ async def run_indexer() -> None:
     Background coroutine that keeps chats fully indexed.
 
     While there is a backlog it processes batches back-to-back (continuous
-    indexing — important during a large /init import), and only sleeps for
-    INDEX_INTERVAL once every chat is fully caught up.
+    indexing — important during a large /init import). Once every chat is
+    fully caught up it waits on recap_db's wake event (set by every message
+    write, live or imported) instead of blindly sleeping, so a brand-new
+    /init upload or live message is picked up within milliseconds instead of
+    waiting out the full INDEX_INTERVAL.
     """
     logger.info(
         "Indexer started (interval=%ss, batch_size=%s)", INDEX_INTERVAL, INDEX_BATCH
@@ -380,10 +387,29 @@ async def run_indexer() -> None:
             logger.exception("Indexer loop error: %s", exc)
             did_work = False
 
-        # Keep draining immediately while progress is being made; otherwise idle
-        # until the next interval. asyncio.sleep(0) yields control between passes.
+        if did_work:
+            # Keep draining immediately while progress is being made.
+            # asyncio.sleep(0) yields control between passes.
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                break
+            continue
+
+        # Idle: wait until either a new message wakes us up or the interval
+        # elapses, whichever is first.
+        wake_event = recap_db.get_wake_event()
         try:
-            await asyncio.sleep(0 if did_work else INDEX_INTERVAL)
+            if wake_event is not None:
+                wake_event.clear()
+                logger.debug("Indexer idle, waiting for new messages or %ss", INDEX_INTERVAL)
+                try:
+                    await asyncio.wait_for(wake_event.wait(), timeout=INDEX_INTERVAL)
+                    logger.debug("Indexer woken up by new message")
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(INDEX_INTERVAL)
         except asyncio.CancelledError:
             break
 
