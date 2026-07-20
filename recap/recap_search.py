@@ -41,7 +41,7 @@ logger = logging.getLogger("recap-bot.search")
 RECAP_MODEL = os.getenv("RECAP_OPENAI_MODEL", "google/gemini-2.5-flash-lite")
 RECAP_LLM_URL = os.getenv("RECAP_LLM_URL", "https://api.openai.com/v1")
 OPENAI_TOKEN = os.getenv("OPENAI_TOKEN")
-EMBEDDING_MODEL = os.getenv("RECAP_EMBEDDING_MODEL", os.getenv("RECAP_OPENAI_MODEL", "google/gemini-2.5-flash-lite"))
+EMBEDDING_MODEL = os.getenv("RECAP_EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
 _client = None
 
