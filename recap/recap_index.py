@@ -231,6 +231,8 @@ def _fallback_chunks(rows: List[dict], window: int = 15) -> List[dict]:
 
 async def _index_chat(chat_id: int) -> int:
     """Index one batch for a chat. Returns the number of messages indexed."""
+    if not await recap_db.is_search_enabled(chat_id):
+        return 0
     rows = await recap_db.get_unindexed_batch(chat_id, INDEX_BATCH)
     if not rows:
         return 0
@@ -316,6 +318,10 @@ async def _index_chat(chat_id: int) -> int:
             embedding = None
 
         try:
+            # /search_off may have been issued while the LLM was processing.
+            if not await recap_db.is_search_enabled(chat_id):
+                logger.info("Indexing disabled while processing chat_id=%s", chat_id)
+                return indexed_count
             chunk_id = await recap_db.insert_chunk(
                 chat_id=chat_id,
                 summary=chunk["summary"],

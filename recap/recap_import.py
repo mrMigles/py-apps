@@ -277,6 +277,11 @@ async def _run_import(
     """
     count = 0
     try:
+        if not await recap_db.is_search_enabled(chat_id):
+            await status_msg.edit_text(
+                "Импорт остановлен: поиск и индексация в чате выключены."
+            )
+            return
         await status_msg.edit_text("Читаю файл экспорта…")
         try:
             rows = await asyncio.to_thread(
@@ -319,8 +324,15 @@ async def _run_import(
                 )
                 return
 
-            await recap_db.upsert_message(row)
-            count += 1
+            if not await recap_db.is_search_enabled(chat_id):
+                await status_msg.edit_text(
+                    f"Импорт остановлен: индексация выключена. "
+                    f"Загружено сообщений: {count:,}."
+                )
+                return
+
+            if await recap_db.upsert_message(row):
+                count += 1
 
             # Edit progress every 500 messages
             if count % 500 == 0:
@@ -387,6 +399,13 @@ async def cmd_init(update, context) -> None:
     chat_id = chat.id
     user = update.effective_user
 
+    if not await recap_db.is_search_enabled(chat_id):
+        await msg.reply_text(
+            "Поиск и индексация в этом чате выключены. "
+            "Сначала включите их командой /search_on."
+        )
+        return
+
     # Authorisation: admins/owner only (skip for private chats)
     if chat.type != "private":
         try:
@@ -431,6 +450,12 @@ async def cmd_init_status(update, context) -> None:
         return
 
     chat_id = chat.id
+    if not await recap_db.is_search_enabled(chat_id):
+        await msg.reply_text(
+            "Поиск и индексация в этом чате выключены. "
+            "Администратор может включить их командой /search_on."
+        )
+        return
     total = await recap_db.count_messages(chat_id)
     chunks = await recap_db.count_chunks(chat_id)
     unindexed = await recap_db.count_unindexed(chat_id)
@@ -482,6 +507,13 @@ async def on_import_document(update, context) -> None:
     chat_id = chat.id
     if not _awaiting_upload.get(chat_id):
         return  # not in import mode for this chat
+
+    if not await recap_db.is_search_enabled(chat_id):
+        _awaiting_upload.pop(chat_id, None)
+        await msg.reply_text(
+            "Файл не принят: поиск и индексация в чате выключены."
+        )
+        return
 
     doc = msg.document
     if not doc:

@@ -228,6 +228,25 @@ def test_get_write_queue_none_before_init():
     assert recap_db.get_write_queue() is None
 
 
+@pytest.mark.asyncio
+async def test_missing_chat_setting_means_search_disabled(monkeypatch):
+    cursor = MagicMock()
+    cursor.fetchone = AsyncMock(return_value=None)
+    connection = MagicMock()
+    connection.execute = AsyncMock(return_value=cursor)
+    pool = MagicMock()
+    pool.connection.return_value.__aenter__ = AsyncMock(return_value=connection)
+    pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+    monkeypatch.setattr(recap_db, "_pool", pool)
+    monkeypatch.setattr(recap_db, "_search_enabled_cache", {})
+
+    assert await recap_db.is_search_enabled(-100404) is False
+    connection.execute.assert_awaited_once_with(
+        "SELECT search_enabled FROM chat_settings WHERE chat_id = %s",
+        (-100404,),
+    )
+
+
 # =============================================================================
 # recap_import — pure helper functions
 # =============================================================================
@@ -641,6 +660,7 @@ async def test_search_never_trades_off_reply_against_citation(monkeypatch):
     """
     chat_id = -100999
     monkeypatch.setattr(recap_db, "is_enabled", lambda: True)
+    monkeypatch.setattr(recap_db, "is_search_enabled", AsyncMock(return_value=True))
     monkeypatch.setattr(
         recap_search, "_normalise_query_sync", lambda q: json.dumps({"query": q})
     )
@@ -693,3 +713,67 @@ async def test_search_never_trades_off_reply_against_citation(monkeypatch):
     assert first_call.kwargs["text"] == second_call.kwargs["text"]
     assert "#10" in second_call.kwargs["text"]
     assert 'href="https://t.me/c/999/10"' in second_call.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_search_is_disabled_by_default_for_chat(monkeypatch):
+    monkeypatch.setattr(recap_db, "is_enabled", lambda: True)
+    monkeypatch.setattr(recap_db, "is_search_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        recap_search,
+        "_normalise_query_sync",
+        MagicMock(side_effect=AssertionError("LLM must not be called")),
+    )
+
+    update = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_chat = _FakeChat(-100123)
+    context = MagicMock()
+
+    await recap_search.cmd_search(update, context)
+
+    reply = update.effective_message.reply_text.await_args.args[0]
+    assert "выключены" in reply
+    assert "/search_on" in reply
+
+
+@pytest.mark.asyncio
+async def test_search_on_persists_setting_for_admin(monkeypatch):
+    monkeypatch.setattr(recap_db, "is_enabled", lambda: True)
+    set_enabled = AsyncMock()
+    monkeypatch.setattr(recap_db, "set_search_enabled", set_enabled)
+
+    update = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_chat = _FakeChat(-100123)
+    update.effective_chat.type = "supergroup"
+    update.effective_user.id = 42
+    context = MagicMock()
+    context.bot.get_chat_member = AsyncMock(
+        return_value=MagicMock(status="administrator")
+    )
+
+    await recap_search.cmd_search_on(update, context)
+
+    set_enabled.assert_awaited_once_with(-100123, True)
+    assert "включены" in update.effective_message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_search_off_rejected_for_non_admin(monkeypatch):
+    monkeypatch.setattr(recap_db, "is_enabled", lambda: True)
+    set_enabled = AsyncMock()
+    monkeypatch.setattr(recap_db, "set_search_enabled", set_enabled)
+
+    update = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_chat = _FakeChat(-100123)
+    update.effective_chat.type = "supergroup"
+    update.effective_user.id = 42
+    context = MagicMock()
+    context.bot.get_chat_member = AsyncMock(return_value=MagicMock(status="member"))
+
+    await recap_search.cmd_search_off(update, context)
+
+    set_enabled.assert_not_awaited()
+    assert "только администраторам" in update.effective_message.reply_text.await_args.args[0]

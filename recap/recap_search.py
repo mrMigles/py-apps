@@ -343,6 +343,71 @@ def _generate_answer_sync(
 # Telegram command handler
 # ---------------------------------------------------------------------------
 
+async def _can_manage_search(update, context) -> bool:
+    """Allow private-chat users and group administrators/owners."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat:
+        return False
+    if chat.type == "private":
+        return True
+    if not user:
+        await msg.reply_text("Не удалось определить пользователя.")
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except Exception as exc:
+        logger.warning("get_chat_member failed: %s", exc)
+        await msg.reply_text("Не удалось проверить права. Попробуй позже.")
+        return False
+    if member.status not in ("administrator", "creator"):
+        await msg.reply_text("Эта команда доступна только администраторам чата.")
+        return False
+    return True
+
+
+async def _set_search_enabled(update, context, enabled: bool) -> None:
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    if not recap_db.is_enabled():
+        await msg.reply_text(
+            "Постоянная история не настроена — PostgreSQL не подключён. "
+            "Задайте PG_DATABASE и перезапустите бот."
+        )
+        return
+    if not await _can_manage_search(update, context):
+        return
+
+    try:
+        await recap_db.set_search_enabled(chat.id, enabled)
+    except Exception as exc:
+        logger.exception("Failed to update search setting for chat_id=%s: %s", chat.id, exc)
+        await msg.reply_text("Не удалось сохранить настройку поиска. Попробуй позже.")
+        return
+    if enabled:
+        await msg.reply_text(
+            "Индексация и поиск включены. Новые сообщения этого чата будут "
+            "сохраняться; поиск доступен через /search."
+        )
+    else:
+        await msg.reply_text(
+            "Индексация и поиск выключены. Новые сообщения не сохраняются. "
+            "Уже сохранённая история не удалена."
+        )
+
+
+async def cmd_search_on(update, context) -> None:
+    """Enable persistent history indexing and search for the current chat."""
+    await _set_search_enabled(update, context, True)
+
+
+async def cmd_search_off(update, context) -> None:
+    """Disable persistent history indexing and search for the current chat."""
+    await _set_search_enabled(update, context, False)
+
 def extract_search_query(text: str) -> Optional[str]:
     """Return the query from any supported search command spelling."""
     match = _SEARCH_QUERY_PATTERN.match(text.strip())
@@ -364,6 +429,13 @@ async def cmd_search(update, context) -> None:
         await msg.reply_text(
             "Постоянная история не настроена — PostgreSQL не подключён. "
             "Задайте PG_DATABASE и перезапустите бот."
+        )
+        return
+
+    if not await recap_db.is_search_enabled(chat.id):
+        await msg.reply_text(
+            "Поиск и индексация в этом чате выключены. "
+            "Администратор может включить их командой /search_on."
         )
         return
 

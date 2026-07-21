@@ -41,6 +41,7 @@ EMBEDDING_DIM = int(os.getenv("RECAP_EMBEDDING_DIM", "1536"))
 _pool = None  # set by init_pool()
 _write_queue: Optional[asyncio.Queue] = None
 _wake_event: Optional[asyncio.Event] = None
+_search_enabled_cache: dict[int, bool] = {}
 
 
 def is_enabled() -> bool:
@@ -84,6 +85,7 @@ async def init_pool() -> None:
     await _pool.open()
     _write_queue = asyncio.Queue()
     _wake_event = asyncio.Event()
+    _search_enabled_cache.clear()
 
     await _bootstrap_schema()
     logger.info(
@@ -97,6 +99,7 @@ async def close_pool() -> None:
     if _pool:
         await _pool.close()
         _pool = None
+    _search_enabled_cache.clear()
 
 
 def get_write_queue() -> Optional[asyncio.Queue]:
@@ -171,6 +174,12 @@ CREATE INDEX IF NOT EXISTS chunks_chat_id ON chunks (chat_id);
 CREATE INDEX IF NOT EXISTS chunks_tsv     ON chunks USING GIN (tsv);
 CREATE INDEX IF NOT EXISTS chunks_dates   ON chunks (chat_id, start_date, end_date);
 
+CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id         BIGINT      PRIMARY KEY,
+    search_enabled  BOOLEAN     NOT NULL DEFAULT FALSE,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS
     important_message_ids BIGINT[] NOT NULL DEFAULT ARRAY[]::BIGINT[];
 """
@@ -180,6 +189,49 @@ async def _bootstrap_schema() -> None:
     async with _pool.connection() as conn:
         await conn.execute(_SCHEMA_SQL)
     logger.info("DB schema bootstrapped (embedding_dim=%s)", EMBEDDING_DIM)
+
+
+# ---------------------------------------------------------------------------
+# Per-chat search/indexing opt-in
+# ---------------------------------------------------------------------------
+
+async def is_search_enabled(chat_id: int) -> bool:
+    """Return whether persistent storage, indexing and search are enabled."""
+    if not _pool:
+        return False
+    if chat_id in _search_enabled_cache:
+        return _search_enabled_cache[chat_id]
+
+    async with _pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT search_enabled FROM chat_settings WHERE chat_id = %s",
+            (chat_id,),
+        )
+        row = await cur.fetchone()
+
+    enabled = bool(row and row[0])
+    _search_enabled_cache[chat_id] = enabled
+    return enabled
+
+
+async def set_search_enabled(chat_id: int, enabled: bool) -> None:
+    """Persist the per-chat opt-in flag and update the local fast-path cache."""
+    if not _pool:
+        raise RuntimeError("DB pool is not initialised")
+    async with _pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO chat_settings (chat_id, search_enabled, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (chat_id) DO UPDATE SET
+                search_enabled = EXCLUDED.search_enabled,
+                updated_at = NOW()
+            """,
+            (chat_id, enabled),
+        )
+    _search_enabled_cache[chat_id] = enabled
+    if enabled:
+        wake_indexer()
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +274,14 @@ ON CONFLICT (chat_id, message_id) DO UPDATE SET
 """
 
 
-async def upsert_message(row: dict) -> None:
+async def upsert_message(row: dict) -> bool:
     """Upsert one message dict (as produced by _cm_to_db_row) into messages."""
-    if not _pool:
-        return
+    if not _pool or not await is_search_enabled(row["chat_id"]):
+        return False
     async with _pool.connection() as conn:
         await conn.execute(_UPSERT_MSG_SQL, row)
     wake_indexer()
+    return True
 
 
 async def wipe_chat(chat_id: int) -> None:
@@ -253,12 +306,17 @@ async def wipe_chat(chat_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 async def get_chats_with_unindexed() -> List[int]:
-    """Return chat_ids that have at least one message not yet assigned to a chunk."""
+    """Return opted-in chat_ids with messages not yet assigned to a chunk."""
     if not _pool:
         return []
     async with _pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT DISTINCT chat_id FROM messages WHERE chunk_id IS NULL"
+            """
+            SELECT DISTINCT m.chat_id
+            FROM messages AS m
+            JOIN chat_settings AS s ON s.chat_id = m.chat_id
+            WHERE m.chunk_id IS NULL AND s.search_enabled = TRUE
+            """
         )
         return [r[0] for r in await cur.fetchall()]
 

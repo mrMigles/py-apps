@@ -378,8 +378,8 @@ async def _add_to_history(
       before_len - len(chat_history[chat_id]),
       )
 
-  # Enqueue for persistent storage (non-blocking; no effect if PG not configured)
-  if recap_db.is_enabled():
+  # Persistent history is opt-in per chat. In-memory recap remains available.
+  if recap_db.is_enabled() and await recap_db.is_search_enabled(chat_id):
     q = recap_db.get_write_queue()
     if q is not None:
       try:
@@ -895,7 +895,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     "1) Пролистай чат до первого непрочитанного сообщения.\n"
     "2) Ответь на него реплаем с командой /recap.\n"
     "3) Я возьму сообщения с него за последние сутки и сделаю живой пересказ.\n\n"
-    "Поиск по истории: /search запрос, /s запрос, /п запрос или ? запрос.\n\n"
+    "Поиск по истории: администратор включает его командой /search_on и "
+    "выключает командой /search_off. Затем доступны /search запрос, /s запрос, "
+    "/п запрос или ? запрос.\n\n"
     "Важно: для работы в группах у бота должен быть выключен privacy mode, "
     "и бот должен быть добавлен в группу после изменения настройки."
   )
@@ -979,6 +981,8 @@ def main() -> None:
 
   application.add_handler(CommandHandler("recap", cmd_recap))
   application.add_handler(CommandHandler("help", cmd_help))
+  application.add_handler(CommandHandler("search_on", recap_search.cmd_search_on))
+  application.add_handler(CommandHandler("search_off", recap_search.cmd_search_off))
   application.add_handler(CommandHandler(["search", "s"], recap_search.cmd_search))
   application.add_handler(CommandHandler("init", recap_import.cmd_init))
   application.add_handler(CommandHandler("init_status", recap_import.cmd_init_status))
