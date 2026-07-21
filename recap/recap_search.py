@@ -37,6 +37,15 @@ import recap_db
 
 logger = logging.getLogger("recap-bot.search")
 
+SEARCH_TEXT_ALIAS_PATTERN = re.compile(
+    r"^(?:/п(?:@[A-Za-z0-9_]+)?|\?)(?:\s|$)",
+    re.IGNORECASE,
+)
+_SEARCH_QUERY_PATTERN = re.compile(
+    r"^(?:/(?:search|s|п)(?:@[A-Za-z0-9_]+)?|\?)(?:\s+(?P<query>.*))?$",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -334,8 +343,16 @@ def _generate_answer_sync(
 # Telegram command handler
 # ---------------------------------------------------------------------------
 
+def extract_search_query(text: str) -> Optional[str]:
+    """Return the query from any supported search command spelling."""
+    match = _SEARCH_QUERY_PATTERN.match(text.strip())
+    if not match:
+        return None
+    return (match.group("query") or "").strip()
+
+
 async def cmd_search(update, context) -> None:
-    """Handle /search <query>."""
+    """Handle /search, /s, /п and ? search requests."""
     from telegram.constants import ParseMode
 
     msg = update.effective_message
@@ -350,11 +367,20 @@ async def cmd_search(update, context) -> None:
         )
         return
 
-    if not context.args:
-        await msg.reply_text("Использование: /search <запрос>")
-        return
+    message_text = getattr(msg, "text", None)
+    query_text = (
+        extract_search_query(message_text)
+        if isinstance(message_text, str)
+        else None
+    )
+    if query_text is None:
+        query_text = " ".join(getattr(context, "args", None) or []).strip()
 
-    query_text = " ".join(context.args)
+    if not query_text:
+        await msg.reply_text(
+            "Использование: /search <запрос> (также /s, /п и ?)"
+        )
+        return
     chat_id = chat.id
     chat_username = getattr(chat, "username", None)
     prefix = _link_prefix(chat_id, chat_username)

@@ -484,6 +484,28 @@ def test_parse_chunk_json_not_array():
 # =============================================================================
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/search клубника", "клубника"),
+        ("/search@recap_bot клубника", "клубника"),
+        ("/s  клубника вчера", "клубника вчера"),
+        ("/п клубника", "клубника"),
+        ("? клубника", "клубника"),
+        ("?\nклубника", "клубника"),
+        ("/s", ""),
+        ("обычное сообщение", None),
+    ],
+)
+def test_extract_search_query_aliases(text, expected):
+    assert recap_search.extract_search_query(text) == expected
+
+
+@pytest.mark.parametrize("text", ["/п запрос", "/П запрос", "? запрос", "?"])
+def test_search_text_alias_pattern(text):
+    assert recap_search.SEARCH_TEXT_ALIAS_PATTERN.search(text)
+
+
 def test_parse_search_filters_basic():
     raw = json.dumps({
         "query": "что обсуждали про деплой",

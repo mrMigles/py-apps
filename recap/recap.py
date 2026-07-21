@@ -895,6 +895,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     "1) Пролистай чат до первого непрочитанного сообщения.\n"
     "2) Ответь на него реплаем с командой /recap.\n"
     "3) Я возьму сообщения с него за последние сутки и сделаю живой пересказ.\n\n"
+    "Поиск по истории: /search запрос, /s запрос, /п запрос или ? запрос.\n\n"
     "Важно: для работы в группах у бота должен быть выключен privacy mode, "
     "и бот должен быть добавлен в группу после изменения настройки."
   )
@@ -978,10 +979,17 @@ def main() -> None:
 
   application.add_handler(CommandHandler("recap", cmd_recap))
   application.add_handler(CommandHandler("help", cmd_help))
-  application.add_handler(CommandHandler("search", recap_search.cmd_search))
+  application.add_handler(CommandHandler(["search", "s"], recap_search.cmd_search))
   application.add_handler(CommandHandler("init", recap_import.cmd_init))
   application.add_handler(CommandHandler("init_status", recap_import.cmd_init_status))
   application.add_handler(CommandHandler("init_cancel", recap_import.cmd_init_cancel))
+
+  application.add_handler(
+      MessageHandler(
+          filters.TEXT & filters.Regex(recap_search.SEARCH_TEXT_ALIAS_PATTERN),
+          recap_search.cmd_search,
+      )
+  )
 
   application.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, on_voice_or_video_note))
   application.add_handler(MessageHandler(filters.PHOTO, on_photo))
