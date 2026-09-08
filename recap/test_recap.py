@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -62,6 +63,30 @@ def test_link_prefix_for_public_and_private_supergroups():
     assert recap._link_prefix(-100123, "my_chat") == "https://t.me/my_chat/"
     assert recap._link_prefix(-100123, None) == "https://t.me/c/123/"
     assert recap._link_prefix(-123, None) is None
+
+
+def test_reaction_update_is_not_treated_as_new_media():
+    update = SimpleNamespace(
+        message_reaction=SimpleNamespace(),
+        message_reaction_count=None,
+    )
+
+    assert recap._is_reaction_update(update)
+
+
+@pytest.mark.asyncio
+async def test_media_handler_ignores_reaction_update(monkeypatch):
+    update = SimpleNamespace(
+        message_reaction=SimpleNamespace(),
+        message_reaction_count=None,
+        effective_message=SimpleNamespace(voice=SimpleNamespace(), video_note=None),
+    )
+    transcribe = AsyncMock(side_effect=AssertionError("must not transcribe reactions"))
+    monkeypatch.setattr(recap, "_transcribe_telegram_media", transcribe)
+
+    await recap.on_voice_or_video_note(update, MagicMock())
+
+    transcribe.assert_not_awaited()
 
 
 def test_sanitize_links_keeps_only_known_messages():

@@ -774,6 +774,18 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ==========================
 
 
+def _is_reaction_update(update: Update) -> bool:
+  """Return whether Telegram delivered a reaction-only update.
+
+  Reaction updates can expose the reacted-to message as ``effective_message``
+  in python-telegram-bot.  They must not be treated as a new media message.
+  """
+  return (
+      getattr(update, "message_reaction", None) is not None
+      or getattr(update, "message_reaction_count", None) is not None
+  )
+
+
 async def debug_raw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   """Log every update as dict to see what exactly we receive."""
   try:
@@ -785,6 +797,8 @@ async def debug_raw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_regular_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   """Store every non-command message in history if it has text/caption."""
+  if _is_reaction_update(update):
+    return
   msg = update.effective_message
   if not msg:
     return
@@ -802,6 +816,9 @@ async def on_regular_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def on_voice_or_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   """Transcribe Telegram voice messages and video notes, then store them in history."""
+  if _is_reaction_update(update):
+    logger.info("Ignoring reaction update for media message")
+    return
   msg = update.effective_message
   if not msg or not (msg.voice or msg.video_note):
     return
