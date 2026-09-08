@@ -75,6 +75,40 @@ def test_reaction_update_is_not_treated_as_new_media():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("media_kind", ["voice", "video_note"])
+@pytest.mark.parametrize("update_kind", ["message", "channel_post", "business_message"])
+async def test_media_edits_do_not_repeat_transcription(monkeypatch, media_kind, update_kind):
+    payload = {
+        "message_id": 42,
+        "date": 1788880000,
+        "chat": {"id": -100123, "type": "supergroup"},
+        "from": {"id": 7, "is_bot": False, "first_name": "Иван"},
+        media_kind: {"file_id": "media", "file_unique_id": "unique", "duration": 45,
+                     **({"length": 240} if media_kind == "video_note" else {})},
+    }
+    original = recap.Update.de_json({"update_id": 1, update_kind: payload}, None)
+    edited = recap.Update.de_json({
+        "update_id": 2, "edited_" + update_kind: {**payload, "edit_date": 1788908000},
+    }, None)
+    transcribe = AsyncMock(return_value="Расшифровка")
+    reply = AsyncMock(return_value=MagicMock())
+    add_history = AsyncMock()
+    monkeypatch.setattr(recap, "_transcribe_telegram_media", transcribe)
+    monkeypatch.setattr(recap.Message, "reply_text", reply)
+    monkeypatch.setattr(recap, "_add_to_history", add_history)
+
+    await recap.on_voice_or_video_note(original, MagicMock())
+    await recap.on_voice_or_video_note(edited, MagicMock())
+    # Even with empty history (e.g. after restart), edits must stay silent.
+    recap.chat_history.clear()
+    await recap.on_voice_or_video_note(edited, MagicMock())
+
+    transcribe.assert_awaited_once_with(original.effective_message)
+    reply.assert_awaited_once_with("Расшифровка")
+    add_history.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_media_handler_ignores_reaction_update(monkeypatch):
     update = SimpleNamespace(
         message_reaction=SimpleNamespace(),
