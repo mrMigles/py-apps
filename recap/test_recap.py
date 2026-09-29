@@ -914,7 +914,13 @@ def _window_for(chat_id, start, end, **kw):
     return [{"message_id": 20, "media_source_message_id": None, "user_name": "Пётр", "text": "Второе обсуждение"}]
 
 
-async def _run_search(monkeypatch, user_id=42, answer="Билеты у Ивана."):
+def _answer_by_window(messages, query):
+    if messages[0]["message_id"] == 9:
+        return "Билеты у Ивана."
+    return "Во втором обсуждении тоже про билеты [id=20]."
+
+
+async def _run_search(monkeypatch, user_id=42, answer=_answer_by_window, judge="[1, 2]"):
     chat_id = -100999
     recap_search._SESSIONS.clear()
     monkeypatch.setattr(recap_db, "is_enabled", lambda: True)
@@ -924,7 +930,13 @@ async def _run_search(monkeypatch, user_id=42, answer="Билеты у Иван�
     )
     monkeypatch.setattr(recap_search, "find_discussions", AsyncMock(return_value=_two_candidates()))
     monkeypatch.setattr(recap_db, "get_context_window", AsyncMock(side_effect=_window_for))
-    monkeypatch.setattr(recap_search, "_generate_answer_sync", lambda messages, query: answer)
+    monkeypatch.setattr(recap_search, "_generate_answer_sync", answer)
+    if isinstance(judge, Exception):
+        def failing_judge(query, snippets, limit):
+            raise judge
+        monkeypatch.setattr(recap_search, "_judge_sync", failing_judge)
+    else:
+        monkeypatch.setattr(recap_search, "_judge_sync", lambda query, snippets, limit: judge)
 
     processing_msg = _FakeMessage()
     update = MagicMock()
@@ -944,9 +956,8 @@ def _buttons(markup):
 
 @pytest.mark.asyncio
 async def test_search_edits_status_message_into_result_with_buttons(monkeypatch):
-    processing_msg = await _run_search(monkeypatch, answer="Билеты у Ивана.")
+    processing_msg = await _run_search(monkeypatch)
 
-    processing_msg.edit_text.assert_awaited_once()
     call = processing_msg.edit_text.await_args
     text = call.args[0]
     assert "Результат 1/2" in text
@@ -958,6 +969,47 @@ async def test_search_edits_status_message_into_result_with_buttons(monkeypatch)
     (session,) = recap_search._SESSIONS.values()
     assert session.user_id == 42
     assert session.index == 0
+
+
+@pytest.mark.asyncio
+async def test_search_drops_pages_whose_answer_is_no(monkeypatch):
+    def answer(messages, query):
+        if messages[0]["message_id"] == 9:
+            return "НЕТ"
+        return "В этой переписке нет информации о билетах [id=20]."
+
+    processing_msg = await _run_search(monkeypatch, answer=answer)
+
+    text = processing_msg.edit_text.await_args.args[0]
+    assert text.startswith("Не нашёл, где обсуждали «билеты»")
+    assert "reply_markup" not in processing_msg.edit_text.await_args.kwargs
+    assert not recap_search._SESSIONS
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_only_what_the_judge_accepts_in_its_order(monkeypatch):
+    processing_msg = await _run_search(monkeypatch, judge="[2]")
+
+    call = processing_msg.edit_text.await_args
+    assert "Результат 1/1" in call.args[0]
+    assert "Второе обсуждение" in call.args[0]
+    assert _buttons(call.kwargs["reply_markup"]) == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_search_judge_rejecting_everything_means_not_found(monkeypatch):
+    answer = MagicMock(side_effect=AssertionError("no answer for rejected pages"))
+    processing_msg = await _run_search(monkeypatch, judge="[]", answer=answer)
+
+    assert processing_msg.edit_text.await_args.args[0].startswith("Не нашёл")
+    assert not recap_search._SESSIONS
+
+
+@pytest.mark.asyncio
+async def test_search_judge_failure_keeps_search_order(monkeypatch):
+    processing_msg = await _run_search(monkeypatch, judge=RuntimeError("LLM down"))
+
+    assert "Результат 1/2" in processing_msg.edit_text.await_args.args[0]
 
 
 def _callback(session, action, user_id, chat_id=-100999):
@@ -974,25 +1026,34 @@ def _callback(session, action, user_id, chat_id=-100999):
 
 
 @pytest.mark.asyncio
-async def test_more_by_author_edits_same_message_with_next_result(monkeypatch):
+async def test_more_and_back_edit_the_same_message(monkeypatch):
     await _run_search(monkeypatch)
     (session,) = recap_search._SESSIONS.values()
 
     update, query = _callback(session, "more", 42)
     await recap_search.on_search_callback(update, MagicMock())
-
-    query.edit_message_text.assert_awaited_once()
     call = query.edit_message_text.await_args
     assert "Результат 2/2" in call.args[0]
     assert "Второе обсуждение" in call.args[0]
-    # Last result: «Ещё» disappears, «OK» stays.
-    assert _buttons(call.kwargs["reply_markup"]) == ["ok"]
-    assert session.index == 1
+    # Last page: «Назад» and «OK», no «Ещё».
+    assert _buttons(call.kwargs["reply_markup"]) == ["prev", "ok"]
 
     # Another «Ещё» on the last page does not edit anything.
     update, query = _callback(session, "more", 42)
     await recap_search.on_search_callback(update, MagicMock())
     query.edit_message_text.assert_not_awaited()
+
+    update, query = _callback(session, "prev", 42)
+    await recap_search.on_search_callback(update, MagicMock())
+    call = query.edit_message_text.await_args
+    assert "Результат 1/2" in call.args[0]
+    assert _buttons(call.kwargs["reply_markup"]) == ["ok", "more"]
+
+    # «Назад» on the first page does nothing.
+    update, query = _callback(session, "prev", 42)
+    await recap_search.on_search_callback(update, MagicMock())
+    query.edit_message_text.assert_not_awaited()
+    assert session.index == 0
 
 
 @pytest.mark.asyncio
@@ -1000,7 +1061,7 @@ async def test_buttons_are_only_for_search_author(monkeypatch):
     await _run_search(monkeypatch)
     (session,) = recap_search._SESSIONS.values()
 
-    for action in ("more", "ok"):
+    for action in ("more", "prev", "ok"):
         update, query = _callback(session, action, user_id=7)
         await recap_search.on_search_callback(update, MagicMock())
         assert query.answer.await_args.kwargs.get("show_alert") is True
@@ -1030,6 +1091,81 @@ async def test_expired_search_session_alerts(monkeypatch):
     await recap_search.on_search_callback(update, MagicMock())
     assert "устарел" in query.answer.await_args.args[0]
     query.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "answer, expected",
+    [
+        ("НЕТ", True),
+        (" нет. ", True),
+        ("В предоставленном фрагменте нет информации о том, где Стас рассказывал про бассейн. [id=1]", True),
+        ("В данном фрагменте Стас не рассказывает о басике. Он упоминает Russian Fishing 4.", True),
+        ("Нет, билеты брали на сайте авиакомпании [id=1].", False),
+        ("Стас рассказывал про бассейн [id=184]: там мало людей после 15:00.", False),
+        ("", False),
+    ],
+)
+def test_is_no_answer(answer, expected):
+    assert recap_search.is_no_answer(answer) is expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("[2, 1]", [1, 0]),
+        ("```json\n[3, 3, 9, 0, 1]\n```", [2, 0]),
+        ("Подходят: [2]", [1]),
+        ("[]", []),
+        ("не знаю", None),
+        ('{"a": 1}', None),
+    ],
+)
+def test_parse_judge_response(raw, expected):
+    assert recap_search.parse_judge_response(raw, 3) == expected
+
+
+def test_build_judge_snippet_is_compact():
+    window = [
+        {"user_name": "Иван", "text": "первое\n\nсообщение"},
+        {"user_name": "Пётр", "text": "x" * 500},
+        {"user_name": "Оля", "text": "третье"},
+    ]
+    snippet = recap_search.build_judge_snippet(window, max_chars=235)
+    assert snippet.split("\n") == ["Иван: первое сообщение", "Пётр: " + "x" * 200]
+
+
+# Telegram Desktop exports pre-supergroup history with negative message ids.
+LEGACY_ID = -999449651
+
+
+def test_legacy_negative_ids_never_leak_or_link():
+    prefix = "https://t.me/c/999/"
+    raw = f"Стас рассказал про бассейн [id={LEGACY_ID}] и дорожки [id=184]. [id=-999509936] [id=-999509935]"
+    valid = {LEGACY_ID, 184, -999509936, -999509935}
+    assert recap_search.extract_cited_ids(raw, valid) == [LEGACY_ID, 184, -999509936, -999509935]
+    html_text = recap_search.convert_id_markers_to_links(raw, prefix, valid)
+    assert html_text == f'Стас рассказал про бассейн и дорожки <a href="{prefix}184">#184</a>.'
+    assert "999" not in html_text.replace(prefix, "")
+
+
+def test_ensure_citation_skips_legacy_ids():
+    assert recap_search.ensure_citation("Ответ.", [LEGACY_ID, 7]) == "Ответ. [id=7]"
+    assert recap_search.ensure_citation("Ответ.", [LEGACY_ID]) == "Ответ."
+    # A legacy marker already counts as a citation, it is not duplicated.
+    assert recap_search.ensure_citation(f"Ответ [id={LEGACY_ID}].", [7]) == f"Ответ [id={LEGACY_ID}]."
+
+
+def test_build_excerpt_legacy_message_has_no_link():
+    window = [
+        {"message_id": LEGACY_ID, "media_source_message_id": None, "user_name": "Стас", "text": "Клубника"},
+        {"message_id": 5, "media_source_message_id": None, "user_name": "Иван", "text": "Бассейн"},
+    ]
+    excerpt = recap_search.build_excerpt(window, [LEGACY_ID, 5], [], "https://t.me/c/1/")
+    assert excerpt.split("\n") == [
+        "▫️ <b>Стас</b>: Клубника",
+        '▫️ <b>Иван</b>: Бассейн <a href="https://t.me/c/1/5">#5</a>',
+    ]
+
 
 @pytest.mark.asyncio
 async def test_search_is_disabled_by_default_for_chat(monkeypatch):
@@ -1493,12 +1629,19 @@ async def test_e2e_migration_adds_fts_to_existing_prod_schema(pg):
     assert sorted(hits[0]["matched_terms"]) == [0, 1]
 
 
+E2E_LEGACY_ID = -999000001  # pre-supergroup message from a Telegram Desktop export
+
+
 async def _seed_search_history():
-    """A discussion, a later lone question, search noise and another topic."""
+    """
+    Two real discussions (one containing a legacy pre-supergroup message),
+    a later lone question, search noise and an unrelated topic.
+    """
     await recap_db.set_search_enabled(GROUP_ID, True)
     day1 = datetime(2025, 5, 1, 12, 0, tzinfo=timezone.utc)
     day3 = day1 + timedelta(days=2)
     day5 = day1 + timedelta(days=4)
+    day8 = day1 + timedelta(days=7)
     rows = [
         _db_row(199, 44, "Смотрите, я забронировал отель", day1 - timedelta(minutes=3)),
         _db_row(200, 44, "Билеты в Тбилиси брали на сайте авиакомпании, вышло 200 евро", day1),
@@ -1511,10 +1654,13 @@ async def _seed_search_history():
         # Noise from an old /init import: a search request and the bot's answer.
         _db_row(400, AUTHOR_ID, "? билеты в Тбилиси", day5 + timedelta(minutes=5)),
         _db_row(401, BOT_ID, "Нашёл: билеты в Тбилиси брали на сайте", day5 + timedelta(minutes=6), "Recap"),
+        _db_row(700, 44, "Обратные билеты из Тбилиси взяли на поезд до Еревана", day8),
+        _db_row(E2E_LEGACY_ID, OTHER_ID, "Билеты из Тбилиси в Ереван продают прямо на вокзале", day8 + timedelta(minutes=3)),
+        _db_row(701, OTHER_ID, "Да, поезд удобный, билеты по 30 лари", day8 + timedelta(minutes=5)),
     ]
     for row in rows:
         assert await recap_db.upsert_message(row)
-    # An indexed chunk for the semantic fallback.
+    # An indexed chunk for the semantic fallback — about something else.
     await recap_db.insert_chunk(
         chat_id=GROUP_ID, summary="Футбол в субботу", keywords=["футбол"],
         message_ids=[250, 251], first_message_id=250,
@@ -1525,28 +1671,48 @@ async def _seed_search_history():
 
 def _search_llm(system, user):
     if "нормализуешь" in system:
+        if "бассейн" in user:
+            return json.dumps({"query": "бассейн", "keywords": ["бассейн"]})
         return json.dumps({
             "query": "где покупали билеты в Тбилиси",
             "keywords": ["билеты", "Тбилиси"],
         })
+    if "проверяешь результаты" in system:
+        # Accept every fragment that talks about tickets; reject the rest.
+        blocks = user.split("### ")[1:]
+        return json.dumps([
+            int(block.split("\n", 1)[0]) for block in blocks if "билет" in block.lower()
+        ])
     if "[id=200]" in user:
         return "Билеты брали на сайте авиакомпании [id=200], вышло 200 евро."
-    if "[id=300]" in user:
-        return "Здесь только вопрос, ответа нет."
-    return "Про билеты тут ничего нет."
+    if "[id=700]" in user:
+        return (
+            "Обратно ехали поездом до Еревана [id=700], билеты продают "
+            f"на вокзале [id={E2E_LEGACY_ID}]."
+        )
+    # The lone question: nothing answers it.
+    return "В этой переписке нет ответа, где брали билеты."
 
 
 def _keyboard_actions(markup):
     return [b["callback_data"].rsplit(":", 1)[1] for b in markup["inline_keyboard"][0]]
 
 
+def _callback_data(markup, action):
+    for b in markup["inline_keyboard"][0]:
+        if b["callback_data"].endswith(f":{action}"):
+            return b["callback_data"]
+    raise AssertionError(f"no {action} button")
+
+
 @pytest.mark.asyncio
-async def test_e2e_search_finds_discussion_and_paginates(pg, tg, monkeypatch):
+async def test_e2e_search_finds_discussions_and_pages_both_ways(pg, tg, monkeypatch):
     app, fake = tg
     monkeypatch.setattr(recap_db, "PG_DATABASE", urlparse(pg).path.lstrip("/"))
     await recap_db.init_pool()
     await _seed_search_history()
-    monkeypatch.setattr(recap_search, "_client", FakeLLM(_search_llm))
+    llm = FakeLLM(_search_llm)
+    monkeypatch.setattr(recap_search, "_client", llm)
     recap_search._SESSIONS.clear()
 
     await send_text(app, "? где мы покупали билеты в Тбилиси", 500)
@@ -1557,52 +1723,81 @@ async def test_e2e_search_finds_discussion_and_paginates(pg, tg, monkeypatch):
     assert searching["reply_parameters"]["message_id"] == 500
     result_id = fake.calls[-1][1]["message_id"]
     first = fake.sent("editMessageText")[-1]
-    assert "Результат 1/3" in first["text"]
-    # The discussion, not the later question or the old search/bot noise.
-    assert 'Билеты брали на сайте авиакомпании <a href="https://t.me/c/777/200">#200</a>' in first["text"]
-    assert "t.me/c/777/201" in first["text"]
-    for noise in ("/300", "/400", "/401"):
-        assert noise not in first["text"]
     assert _keyboard_actions(first["reply_markup"]) == ["ok", "more"]
-    token = first["reply_markup"]["inline_keyboard"][0][1]["callback_data"]
+
+    # The judge saw the football chunk and rejected it; the lone question was
+    # accepted by the judge but its answer is "no answer" → not shown either.
+    judge_prompt = next(u for s, u in llm.prompts if "проверяешь результаты" in s)
+    assert "футбол" in judge_prompt
+    assert any("[id=300]" in u for _, u in llm.prompts)
 
     # Somebody else cannot page through the author's search.
     edits_before = len(fake.sent("editMessageText"))
-    await press_button(app, token, OTHER_ID, result_id)
+    await press_button(app, _callback_data(first["reply_markup"], "more"), OTHER_ID, result_id)
     alert = fake.sent("answerCallbackQuery")[-1]
     assert alert["show_alert"] is True and "автору" in alert["text"]
     assert len(fake.sent("editMessageText")) == edits_before
 
-    # «Ещё» edits the same message: the lone question comes next…
-    await press_button(app, token, AUTHOR_ID, result_id)
+    # «Ещё» edits the same message; the last page has «Назад» and «OK».
+    await press_button(app, _callback_data(first["reply_markup"], "more"), AUTHOR_ID, result_id)
     second = fake.sent("editMessageText")[-1]
     assert int(second["message_id"]) == int(result_id)
-    assert "Результат 2/3" in second["text"]
-    assert "t.me/c/777/300" in second["text"]
-    assert "t.me/c/777/301" in second["text"]  # the follow-up is shown too
+    assert _keyboard_actions(second["reply_markup"]) == ["prev", "ok"]
 
-    # …then the semantic (embedding) match, with «Ещё» gone on the last page.
-    await press_button(app, token, AUTHOR_ID, result_id)
-    third = fake.sent("editMessageText")[-1]
-    assert "Результат 3/3" in third["text"]
-    assert "футбол" in third["text"]
-    assert _keyboard_actions(third["reply_markup"]) == ["ok"]
+    pages = {"Результат 1/2": first["text"], "Результат 2/2": second["text"]}
+    for header, text in pages.items():
+        assert header in text
+    by_topic = {
+        ("200" if "t.me/c/777/200" in t else "700"): t for t in pages.values()
+    }
+    assert set(by_topic) == {"200", "700"}
+    assert 'Билеты брали на сайте авиакомпании <a href="https://t.me/c/777/200">#200</a>' in by_topic["200"]
+    assert "t.me/c/777/201" in by_topic["200"]
+    # The legacy message is shown and cited in the answer, but never linked.
+    assert "продают прямо на вокзале" in by_topic["700"]
+    assert "билеты продают на вокзале." in by_topic["700"]
+    assert "999000001" not in by_topic["700"]
 
-    # Old search requests and the bot's own answers never show up anywhere.
-    for page in (first, second, third):
-        for noise in ("/400", "/401", "? билеты", "Нашёл:"):
-            assert noise not in page["text"]
+    # Nothing that says "no answer", no lone question, no noise, no football.
+    for text in pages.values():
+        for bad in ("нет ответа", "/300", "/400", "/401", "? билеты", "Нашёл:", "футбол", "[id="):
+            assert bad not in text
+
+    # «Назад» brings the first page back, exactly as it was.
+    await press_button(app, _callback_data(second["reply_markup"], "prev"), AUTHOR_ID, result_id)
+    back = fake.sent("editMessageText")[-1]
+    assert back["text"] == first["text"]
+    assert _keyboard_actions(back["reply_markup"]) == ["ok", "more"]
 
     # «OK» removes the buttons and ends the session.
-    await press_button(app, token.replace(":more", ":ok"), AUTHOR_ID, result_id)
+    await press_button(app, _callback_data(back["reply_markup"], "ok"), AUTHOR_ID, result_id)
     (removed,) = fake.sent("editMessageReplyMarkup")
     assert int(removed["message_id"]) == int(result_id)
     assert not removed.get("reply_markup")
     assert not recap_search._SESSIONS
 
     # Later presses are answered as expired.
-    await press_button(app, token, AUTHOR_ID, result_id)
+    await press_button(app, _callback_data(first["reply_markup"], "more"), AUTHOR_ID, result_id)
     assert "устарел" in fake.sent("answerCallbackQuery")[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_e2e_search_with_only_irrelevant_matches_says_not_found(pg, tg, monkeypatch):
+    app, fake = tg
+    monkeypatch.setattr(recap_db, "PG_DATABASE", urlparse(pg).path.lstrip("/"))
+    await recap_db.init_pool()
+    await _seed_search_history()
+    monkeypatch.setattr(recap_search, "_client", FakeLLM(_search_llm))
+    recap_search._SESSIONS.clear()
+
+    # Only the football chunk comes back (semantic fallback) — the judge
+    # rejects it, so the user gets an honest "not found" and no buttons.
+    await send_text(app, "/search бассейн", 600)
+
+    final = fake.sent("editMessageText")[-1]
+    assert final["text"].startswith("Не нашёл, где обсуждали «бассейн»")
+    assert "reply_markup" not in final
+    assert not recap_search._SESSIONS
 
 
 @pytest.mark.asyncio
@@ -1615,4 +1810,4 @@ async def test_e2e_search_nothing_found(pg, tg, monkeypatch):
 
     await send_text(app, "/search билеты", 600)
 
-    assert fake.sent("editMessageText")[-1]["text"] == "По этому запросу ничего не найдено."
+    assert fake.sent("editMessageText")[-1]["text"].startswith("Не нашёл")

@@ -16,12 +16,17 @@ Flow:
      that merely mentions the same words.
   5. Semantic fallback: nearest indexed chunks by embedding fill the list up
      when full-text search finds few discussions.
-  6. One result at a time: the discussion window around the hits is loaded,
-     the LLM writes a short grounded answer using [id=N] markers, and an
-     excerpt of key messages with links is appended.
-  7. The result carries inline buttons «OK» (removes the buttons) and «Ещё»
-     (edits the same message with the next discussion). Only the user who
-     started the search may press them.
+  6. Relevance gate: one LLM call judges all candidate discussions at once,
+     drops those that only share a word with the query (or only ask the
+     question) and reranks the rest. For each kept discussion the LLM writes
+     a short grounded answer with [id=N] markers; an answer of «НЕТ» drops
+     the page as well — a "nothing here" answer is never shown.
+  7. Pages are rendered up front; the result carries inline buttons
+     «Назад», «OK» (removes the buttons) and «Ещё», which edit the same
+     message. Only the user who started the search may press them.
+
+Legacy messages (negative ids from pre-supergroup history in Telegram
+Desktop exports) are searchable but never linked: they have no permalink.
 
 Pure helpers (parse_search_filters, build_term_queries, cluster_hits,
 build_excerpt, convert_id_markers_to_links, …) have no I/O and can be
@@ -319,7 +324,20 @@ def cluster_hits(
     return candidates
 
 
+# [id=N] citation marker. N can be negative: Telegram Desktop exports
+# messages from before a basic group was upgraded to a supergroup with
+# negative ids (id - 2^30). They are searchable, but have no permalink.
+_ID_MARKER_RE = re.compile(r"\[id=(-?\d+)\]")
+
+
+def is_linkable_id(mid: int) -> bool:
+    """False for legacy (pre-supergroup) messages: no link, no reply possible."""
+    return mid > 0
+
+
 def _message_ref(mid: int, link_prefix: Optional[str]) -> str:
+    if not is_linkable_id(mid):
+        return ""
     if not link_prefix:
         return f"(#{mid})"
     return f'<a href="{link_prefix}{mid}">#{mid}</a>'
@@ -366,10 +384,9 @@ def build_excerpt(
         if len(text) > max_len:
             text = text[: max_len - 1] + "…"
         name = html.escape(m.get("user_name") or "?", quote=False)
-        lines.append(
-            f"▫️ <b>{name}</b>: {html.escape(text, quote=False)} "
-            f"{_message_ref(mid, link_prefix)}"
-        )
+        line = f"▫️ <b>{name}</b>: {html.escape(text, quote=False)}"
+        ref = _message_ref(mid, link_prefix)
+        lines.append(f"{line} {ref}" if ref else line)
     return "\n".join(lines)
 
 
@@ -387,11 +404,12 @@ def ensure_citation(
     *valid_ids* (already ordered by relevance/priority, most important first;
     at most 3 are appended) so a link always makes it into the final message.
     """
-    if re.search(r"\[id=\d+\]", answer):
+    if _ID_MARKER_RE.search(answer):
         return answer
-    if not valid_ids:
+    linkable = [mid for mid in valid_ids if is_linkable_id(mid)]
+    if not linkable:
         return answer
-    markers = " ".join(f"[id={mid}]" for mid in valid_ids[:3])
+    markers = " ".join(f"[id={mid}]" for mid in linkable[:3])
     return f"{answer} {markers}".strip()
 
 
@@ -406,7 +424,7 @@ def extract_cited_ids(text: str, valid_ids: set) -> List[int]:
     """
     seen = set()
     ids: List[int] = []
-    for m in re.finditer(r"\[id=(\d+)\]", text):
+    for m in _ID_MARKER_RE.finditer(text):
         mid = int(m.group(1))
         if mid in valid_ids and mid not in seen:
             seen.add(mid)
@@ -429,6 +447,7 @@ def convert_id_markers_to_links(
       marker becomes a plain-text "(#N)" reference instead of a link, so the
       answer still shows *something* traceable rather than silently losing
       every citation.
+    - Legacy (negative) ids have no permalink: the marker is removed.
     - The generated href is: link_prefix + str(id)
     """
     def replace(m: re.Match) -> str:
@@ -437,18 +456,77 @@ def convert_id_markers_to_links(
             return ""
         return _message_ref(mid, link_prefix)
 
-    text = re.sub(r"\[id=(\d+)\]", replace, text)
+    text = _ID_MARKER_RE.sub(replace, text)
 
     # Some models ignore the [id=N] convention and instead dump a raw list of
     # message IDs like "[315950, 315957, ...]". Strip any leftover bracketed
     # groups that contain only digits, commas and whitespace — they are never
     # meaningful prose and only leak internal IDs to the user.
-    text = re.sub(r"\[\s*\d[\d,\s]*\]", "", text)
+    text = re.sub(r"\[\s*-?\d[\d,\s-]*\]", "", text)
 
     # Collapse whitespace left behind by removed markers.
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r" +([.,;:!?])", r"\1", text)
     return text.strip()
+
+
+NO_ANSWER = "НЕТ"
+
+# Answers that only say the topic is not there. The answer prompt asks for a
+# bare «НЕТ», but models still write "в этой переписке … не рассказывает".
+_NO_ANSWER_HINTS = (
+    "нет информации", "нет ответа", "нет данных", "ничего не", "не найден",
+    "не нашл", "не упомина", "не содерж", "не обсужда", "не рассказыва",
+    "не говор", "не сообща", "отсутству",
+)
+
+
+def is_no_answer(answer: str) -> bool:
+    """True when the LLM says the discussion does not answer the question."""
+    text = (answer or "").strip()
+    if not text:
+        return False
+    if re.fullmatch(rf"\W*{NO_ANSWER}\W*", text, flags=re.IGNORECASE):
+        return True
+    first_sentence = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0].lower()
+    return any(hint in first_sentence for hint in _NO_ANSWER_HINTS)
+
+
+def build_judge_snippet(window: List[dict], max_chars: int = 1200) -> str:
+    """Compact text of one candidate discussion for the relevance judge."""
+    lines: List[str] = []
+    size = 0
+    for m in window:
+        text = " ".join((m.get("text") or "").split())[:200]
+        line = f"{m.get('user_name') or '?'}: {text}"
+        if size + len(line) > max_chars and lines:
+            break
+        lines.append(line)
+        size += len(line) + 1
+    return "\n".join(lines)
+
+
+def parse_judge_response(raw: str, n: int) -> Optional[List[int]]:
+    """
+    Parse the judge's JSON array of 1-based candidate numbers into 0-based
+    indexes (deduplicated, in the judge's order). None when unparseable.
+    """
+    text = re.sub(r"^```[a-z]*\n?", "", (raw or "").strip())
+    text = re.sub(r"\n?```$", "", text.rstrip()).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\d,\s]*\]", text)
+        if not match:
+            return None
+        data = json.loads(match.group(0))
+    if not isinstance(data, list):
+        return None
+    result: List[int] = []
+    for item in data:
+        if isinstance(item, int) and 1 <= item <= n and item - 1 not in result:
+            result.append(item - 1)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +544,7 @@ _NORMALISE_USER = """Нормализуй запрос и извлеки фил�
   "keywords": ["3–8 значимых слов или коротких фраз по теме, включая синонимы и другие написания (рус./англ.); БЕЗ вопросительных и служебных слов вроде «когда», «где», «кто», «обсуждали», «говорили»"],
   "date_from": "YYYY-MM-DD или null",
   "date_to":   "YYYY-MM-DD или null",
-  "participants": ["имя1", "имя2"] или null,
+  "participants": ["имена АВТОРОВ, если запрос про то, что кто-то писал или рассказывал; такие имена НЕ клади в keywords"] или null,
   "exact_terms": ["точная фраза"] или null
 }}
 
@@ -495,17 +573,53 @@ def _embed_sync(text: str) -> List[float]:
     return resp.data[0].embedding
 
 
+_JUDGE_SYSTEM = (
+    "Ты проверяешь результаты поиска по истории Telegram-чата. "
+    "Верни ТОЛЬКО JSON-массив целых чисел без markdown и пояснений."
+)
+
+_JUDGE_USER = """\
+Запрос: {query}
+
+Ниже найденные поиском фрагменты переписки. Подходит только фрагмент, где \
+тему запроса ОБСУЖДАЮТ по существу или дают ответ. Не подходит фрагмент, где \
+тему упомянули вскользь, только задали вопрос без ответа, или речь о другом \
+(совпало лишь похожее слово).
+
+Верни JSON-массив номеров подходящих фрагментов, самые полезные первыми, \
+не больше {limit}. Если не подходит ни один — верни [].
+
+{blocks}"""
+
+
+def _judge_sync(query_text: str, snippets: List[str], limit: int) -> str:
+    blocks = "\n\n".join(
+        f"### {i}\n{snippet}" for i, snippet in enumerate(snippets, start=1)
+    )
+    resp = _get_client().chat.completions.create(
+        model=RECAP_MODEL,
+        messages=[
+            {"role": "system", "content": _JUDGE_SYSTEM},
+            {"role": "user", "content": _JUDGE_USER.format(
+                query=query_text, limit=limit, blocks=blocks,
+            )},
+        ],
+        temperature=0.0,
+        max_tokens=100,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
 _ANSWER_SYSTEM = (
-    "Ты отвечаешь на вопросы по истории Telegram-чата. "
-    "Тебе дан фрагмент обсуждения, найденный поиском. "
-    "Ответ — по-русски, 1–3 коротких предложения, по делу. "
+    "Ты отвечаешь на вопросы по истории Telegram-чата по найденной переписке. "
+    "Ответ — по-русски, 1–3 коротких предложения, прямо по сути вопроса. "
+    "Не упоминай «фрагмент», «предоставленные сообщения» и сам поиск. "
     "Опирайся на сообщения, где тему ОБСУЖДАЛИ или ДАЛИ ОТВЕТ, а не на "
     "сообщения, где вопрос только задали. "
     "Ссылайся на источники, вставляя маркер [id=N] сразу после соответствующего "
-    "факта, где N — id одного сообщения. "
-    "НЕ перечисляй id списком и НЕ выводи id, если по теме ничего не нашлось. "
-    "Если во фрагменте тему только упомянули или спросили, но ответа нет — "
-    "так и скажи одним предложением. "
+    "факта, где N — id одного сообщения. НЕ перечисляй id списком. "
+    f"Если в переписке нет ответа на вопрос или тему обсуждали не по существу, "
+    f"верни ровно одно слово {NO_ANSWER} и ничего больше. "
     "Не выдумывай — используй только предоставленные сообщения. "
     "Не генерируй HTML, SQL, Telegram-ссылки или код — только текст с маркерами [id=N]."
 )
@@ -628,7 +742,8 @@ def extract_search_query(text: str) -> Optional[str]:
 # Retrieval and rendering
 # ---------------------------------------------------------------------------
 
-MAX_RESULTS = 10
+MAX_RESULTS = 10  # candidates checked by the relevance judge
+MAX_SHOWN = 5     # pages the user can flip through
 MAX_ANSWER_CHARS = 1800
 
 
@@ -690,22 +805,24 @@ async def find_discussions(
     return candidates
 
 
-async def render_candidate(
-    chat_id: int,
+@dataclass
+class SearchResult:
+    """One page of search output (the header is added when it is shown)."""
+    start: datetime
+    authors: List[str]
+    body: str
+
+
+async def render_result(
     candidate: Candidate,
+    window: List[dict],
     query_text: str,
     link_prefix: Optional[str],
-    position: int,
-    total: int,
-    bot_id: Optional[int] = None,
-) -> str:
-    """Load the discussion window and build the HTML text of one result."""
-    window = await recap_db.get_context_window(
-        chat_id, candidate.start, candidate.end, exclude_user_id=bot_id
-    )
-    if not window:
-        return f"🔎 Результат {position}/{total}: не удалось загрузить сообщения."
-
+) -> Optional[SearchResult]:
+    """
+    Build the page for one discussion, or None when the LLM says it does not
+    answer the question — such a page is never shown.
+    """
     valid_ids = {_canonical_id(m) for m in window}
     hit_ids = [mid for mid in candidate.hit_ids if mid in valid_ids]
     if not hit_ids:
@@ -719,8 +836,11 @@ async def render_candidate(
     try:
         raw_answer = await asyncio.to_thread(_generate_answer_sync, window, query_text)
     except Exception as exc:
+        # The judge already accepted this discussion: show the excerpt alone.
         logger.warning("Answer generation failed (%s); showing excerpt only", exc)
         raw_answer = ""
+    if is_no_answer(raw_answer):
+        return None
     raw_answer = (raw_answer or "")[:MAX_ANSWER_CHARS]
     if raw_answer:
         raw_answer = ensure_citation(raw_answer, hit_ids)
@@ -735,18 +855,75 @@ async def render_candidate(
             name = m.get("user_name") or "?"
             if name not in authors:
                 authors.append(name)
-    header = (
-        f"🔎 <b>Результат {position}/{total}</b> · "
-        f"{candidate.start.strftime('%d.%m.%Y')} · "
-        f"{html.escape(', '.join(authors[:3]), quote=False)}"
-    )
-    parts = [header]
+
+    parts = []
     if answer_html:
         parts.append(answer_html)
     excerpt = build_excerpt(window, hit_ids, cited_ids, link_prefix)
     if excerpt:
         parts.append(excerpt)
-    return "\n\n".join(parts)
+    if not parts:
+        return None
+    return SearchResult(start=candidate.start, authors=authors, body="\n\n".join(parts))
+
+
+def format_page(result: SearchResult, position: int, total: int) -> str:
+    header = (
+        f"🔎 <b>Результат {position}/{total}</b> · "
+        f"{result.start.strftime('%d.%m.%Y')} · "
+        f"{html.escape(', '.join(result.authors[:3]), quote=False)}"
+    )
+    return f"{header}\n\n{result.body}"
+
+
+async def build_results(
+    chat_id: int,
+    candidates: List[Candidate],
+    query_text: str,
+    link_prefix: Optional[str],
+    bot_id: Optional[int] = None,
+) -> List[SearchResult]:
+    """
+    Turn raw candidates into the pages the user will see:
+      1. load each discussion window;
+      2. one LLM call judges all of them at once — drops the ones that only
+         share a word with the query (or only ask the question) and reranks
+         the rest, keeping at most MAX_SHOWN;
+      3. answers for the kept ones are generated in parallel, and a page
+         whose answer is «НЕТ» is dropped too.
+    Everything is rendered up front, so «Ещё»/«Назад» are instant and the
+    «k/N» counter is exact.
+    """
+    loaded: List[tuple] = []
+    for candidate in candidates:
+        window = await recap_db.get_context_window(
+            chat_id, candidate.start, candidate.end, exclude_user_id=bot_id
+        )
+        if window:
+            loaded.append((candidate, window))
+    if not loaded:
+        return []
+
+    order: Optional[List[int]] = None
+    try:
+        raw = await asyncio.to_thread(
+            _judge_sync,
+            query_text,
+            [build_judge_snippet(window) for _, window in loaded],
+            MAX_SHOWN,
+        )
+        order = parse_judge_response(raw, len(loaded))
+    except Exception as exc:
+        logger.warning("Relevance judge failed (%s); keeping search order", exc)
+    if order is None:
+        order = list(range(len(loaded)))
+    chosen = [loaded[i] for i in order[:MAX_SHOWN]]
+
+    rendered = await asyncio.gather(*(
+        render_result(candidate, window, query_text, link_prefix)
+        for candidate, window in chosen
+    ))
+    return [r for r in rendered if r is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -763,14 +940,12 @@ class SearchSession:
     token: str
     chat_id: int
     user_id: Optional[int]
-    query: str
-    link_prefix: Optional[str]
-    candidates: List[Candidate]
-    bot_id: Optional[int] = None
+    results: List[SearchResult]
     index: int = 0
-    pages: Dict[int, str] = field(default_factory=dict)
-    busy: bool = False
     created: float = field(default_factory=time.monotonic)
+
+    def page(self) -> str:
+        return format_page(self.results[self.index], self.index + 1, len(self.results))
 
 
 # In memory only: after a restart the buttons answer «Поиск устарел».
@@ -800,30 +975,29 @@ def _get_session(token: str) -> Optional[SearchSession]:
 
 
 def _keyboard(session: SearchSession):
+    """[◀️ Назад] [👌 OK] [Ещё ▶️] — arrows only where there is somewhere to go."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    buttons = [InlineKeyboardButton(
-        "👌 OK", callback_data=f"{CALLBACK_PREFIX}:{session.token}:ok"
-    )]
-    if session.index < len(session.candidates) - 1:
-        buttons.append(InlineKeyboardButton(
-            "➡️ Ещё", callback_data=f"{CALLBACK_PREFIX}:{session.token}:more"
-        ))
+    def button(text: str, action: str):
+        return InlineKeyboardButton(
+            text, callback_data=f"{CALLBACK_PREFIX}:{session.token}:{action}"
+        )
+
+    buttons = []
+    if session.index > 0:
+        buttons.append(button("◀️ Назад", "prev"))
+    buttons.append(button("👌 OK", "ok"))
+    if session.index < len(session.results) - 1:
+        buttons.append(button("Ещё ▶️", "more"))
     return InlineKeyboardMarkup([buttons])
 
 
-async def _render_page(session: SearchSession, index: int) -> str:
-    if index not in session.pages:
-        session.pages[index] = await render_candidate(
-            session.chat_id,
-            session.candidates[index],
-            session.query,
-            session.link_prefix,
-            index + 1,
-            len(session.candidates),
-            bot_id=session.bot_id,
-        )
-    return session.pages[index]
+def _nothing_found(query_text: str) -> str:
+    return (
+        f"Не нашёл, где обсуждали «{query_text}». "
+        "Попробуй сформулировать иначе или добавить слова, которые могли "
+        "звучать в переписке."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -883,25 +1057,29 @@ async def cmd_search(update, context) -> None:
             logger.warning("Query normalisation failed (%s), using raw query", exc)
             filters = {"query": query_text}
 
-        candidates = await find_discussions(
-            chat_id, filters, query_text,
-            bot_id=bot_id,
-        )
-        if not candidates:
-            await processing_msg.edit_text("По этому запросу ничего не найдено.")
+        candidates = await find_discussions(chat_id, filters, query_text, bot_id=bot_id)
+        results: List[SearchResult] = []
+        if candidates:
+            try:
+                await processing_msg.edit_text(
+                    f"Ищу… проверяю найденные обсуждения ({len(candidates)})"
+                )
+            except Exception as exc:
+                logger.debug("Could not update search status: %s", exc)
+            results = await build_results(
+                chat_id, candidates, query_text, prefix, bot_id=bot_id
+            )
+        if not results:
+            await processing_msg.edit_text(_nothing_found(query_text))
             return
 
         session = _new_session(
             chat_id=chat_id,
             user_id=user_id if isinstance(user_id, int) else None,
-            query=query_text,
-            link_prefix=prefix,
-            candidates=candidates,
-            bot_id=bot_id,
+            results=results,
         )
-        text = await _render_page(session, 0)
         await processing_msg.edit_text(
-            text,
+            session.page(),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=_keyboard(session),
@@ -916,7 +1094,7 @@ async def cmd_search(update, context) -> None:
 
 
 async def on_search_callback(update, context) -> None:
-    """Handle the «OK» / «Ещё» buttons under a search result."""
+    """Handle the «Назад» / «OK» / «Ещё» buttons under a search result."""
     from telegram.constants import ParseMode
 
     query = update.callback_query
@@ -950,30 +1128,23 @@ async def on_search_callback(update, context) -> None:
             logger.debug("Could not remove search keyboard: %s", exc)
         return
 
-    if action != "more":
+    step = {"more": 1, "prev": -1}.get(action)
+    if step is None:
         await query.answer()
         return
-
-    if session.busy:
-        await query.answer("Ищу, подождите…")
-        return
-    if session.index >= len(session.candidates) - 1:
-        await query.answer("Больше результатов нет.")
+    new_index = session.index + step
+    if not 0 <= new_index < len(session.results):
+        await query.answer("Больше результатов нет." if step > 0 else "Это первый результат.")
         return
 
-    session.busy = True
+    await query.answer()
+    session.index = new_index
     try:
-        await query.answer()
-        next_index = session.index + 1
-        text = await _render_page(session, next_index)
-        session.index = next_index
         await query.edit_message_text(
-            text,
+            session.page(),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=_keyboard(session),
         )
     except Exception as exc:
         logger.exception("Search pagination error: %s", exc)
-    finally:
-        session.busy = False
