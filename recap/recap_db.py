@@ -11,14 +11,16 @@ Provides:
 - run_writer(q)     — background task that drains the write queue
 - upsert_message()  — idempotent message INSERT … ON CONFLICT
 - get/insert/set helpers for the indexing pipeline
-- hybrid_search()   — vector + lexical RRF retrieval
+- search_messages()  — message-level full-text search (messages.tsv)
+- get_context_window() — discussion around a set of hits
+- vector_search_chunks() — semantic fallback over indexed chunks
 - count_* helpers   — for /init_status
 """
 
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 logger = logging.getLogger("recap-bot.db")
@@ -182,6 +184,12 @@ CREATE TABLE IF NOT EXISTS chat_settings (
 
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS
     important_message_ids BIGINT[] NOT NULL DEFAULT ARRAY[]::BIGINT[];
+
+-- Message-level full-text search. A generated column is backfilled by
+-- PostgreSQL itself for already stored rows, so no reindex is needed.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('russian'::regconfig, coalesce(text, ''))) STORED;
+CREATE INDEX IF NOT EXISTS messages_tsv ON messages USING GIN (tsv);
 """
 
 
@@ -423,77 +431,172 @@ async def get_chunk_messages(chat_id: int, message_ids: List[int]) -> List[dict]
 
 
 # ---------------------------------------------------------------------------
-# Hybrid retrieval (vector + lexical, reciprocal-rank fusion)
+# Retrieval: message-level full-text search + chunk-level vector fallback
 # ---------------------------------------------------------------------------
 
-async def hybrid_search(
+# Search requests (/search, /s, /п, ? …) and other bot commands are never
+# useful search results — they only echo the question back. Filtering them at
+# query time also cleans up histories imported before the import skipped them.
+_NOT_COMMAND_SQL = r"text !~ '^\s*(/|\?)'"
+
+
+async def search_messages(
+    chat_id: int,
+    tsquery: str,
+    term_queries: List[str],
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    exclude_user_id: Optional[int] = None,
+    limit: int = 300,
+) -> List[dict]:
+    """
+    Full-text search over individual messages of *chat_id*.
+
+    *tsquery* is a to_tsquery() expression (terms OR-ed together, already
+    sanitised by recap_search.build_or_tsquery). *term_queries* are the
+    individual OR-branches; each returned row carries ``matched_terms`` — the
+    0-based indexes of the branches it matches — so the caller can measure how
+    much of the query a discussion covers.
+
+    Bot messages (live or the bot's own id from an import) and search/command
+    texts are excluded.
+    """
+    if not _pool or not tsquery:
+        return []
+
+    conditions = [
+        "chat_id = %(chat_id)s",
+        "tsv @@ q",
+        "NOT is_bot",
+        "user_id IS DISTINCT FROM %(bot_id)s",
+        _NOT_COMMAND_SQL,
+    ]
+    params: dict = {
+        "chat_id": chat_id,
+        "q": tsquery,
+        "terms": term_queries,
+        "bot_id": exclude_user_id,
+        "limit": limit,
+    }
+    if date_from:
+        conditions.append("date >= %(date_from)s")
+        params["date_from"] = date_from
+    if date_to:
+        conditions.append("date <= %(date_to)s")
+        params["date_to"] = date_to
+
+    sql = f"""
+    SELECT message_id, date, user_id, user_name, text, reply_to_message_id,
+           media_source_message_id,
+           ts_rank_cd(tsv, q) AS rank,
+           ARRAY(
+               SELECT (t.i - 1)::int
+               FROM   unnest(%(terms)s::text[]) WITH ORDINALITY AS t(term, i)
+               WHERE  tsv @@ to_tsquery('russian', t.term)
+           ) AS matched_terms
+    FROM   messages, to_tsquery('russian', %(q)s) AS q
+    WHERE  {" AND ".join(conditions)}
+    ORDER  BY rank DESC, date DESC
+    LIMIT  %(limit)s
+    """
+
+    from psycopg.rows import dict_row
+    async with _pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, params)
+            return await cur.fetchall()
+
+
+async def get_context_window(
+    chat_id: int,
+    start_date: datetime,
+    end_date: datetime,
+    before: int = 3,
+    after: int = 15,
+    cap: int = 40,
+    before_span: timedelta = timedelta(hours=1),
+    after_span: timedelta = timedelta(hours=2),
+    exclude_user_id: Optional[int] = None,
+) -> List[dict]:
+    """
+    Load the discussion around [start_date, end_date]: a few messages before
+    the first hit and more after the last one (answers follow questions),
+    ordered chronologically and capped at *cap* messages. Neighbours are only
+    taken within *before_span* / *after_span*, so an unrelated conversation
+    hours later never leaks into the window. Bot messages and search/command
+    texts are skipped, as in search_messages().
+    """
+    if not _pool:
+        return []
+    clean = (
+        f"chat_id = %(chat_id)s AND NOT is_bot "
+        f"AND user_id IS DISTINCT FROM %(bot_id)s AND {_NOT_COMMAND_SQL}"
+    )
+    sql = f"""
+    SELECT * FROM (
+        (SELECT * FROM messages
+         WHERE {clean} AND date < %(start)s AND date >= %(from)s
+         ORDER BY date DESC, message_id DESC LIMIT %(before)s)
+        UNION ALL
+        (SELECT * FROM messages
+         WHERE {clean} AND date >= %(start)s AND date <= %(end)s
+         ORDER BY date, message_id LIMIT %(cap)s)
+        UNION ALL
+        (SELECT * FROM messages
+         WHERE {clean} AND date > %(end)s AND date <= %(until)s
+         ORDER BY date, message_id LIMIT %(after)s)
+    ) AS w
+    ORDER BY date, message_id
+    """
+    params = {
+        "chat_id": chat_id, "bot_id": exclude_user_id,
+        "start": start_date, "end": end_date,
+        "from": start_date - before_span, "until": end_date + after_span,
+        "before": before, "after": after, "cap": cap,
+    }
+    from psycopg.rows import dict_row
+    async with _pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, params)
+            rows = await cur.fetchall()
+    return rows[:cap]
+
+
+async def vector_search_chunks(
     chat_id: int,
     query_embedding: List[float],
-    query_text: str,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
     limit: int = 10,
 ) -> List[dict]:
     """
-    Return chunks for *chat_id* ranked by a reciprocal-rank fusion of:
-      • cosine-distance vector similarity  (embedding <=> query)
-      • ts_rank full-text similarity       (tsv @@ websearch_to_tsquery)
-
-    Optional date filters narrow results to chunks whose [start_date, end_date]
-    interval overlaps the requested range.
+    Semantic fallback: chunks of *chat_id* closest to *query_embedding* by
+    cosine distance. Optional date filters keep chunks whose
+    [start_date, end_date] interval overlaps the requested range.
     """
     if not _pool:
         return []
 
-    base_conditions = ["chat_id = %(chat_id)s"]
+    conditions = ["chat_id = %(chat_id)s", "embedding IS NOT NULL"]
     params: dict = {
         "chat_id": chat_id,
         "emb": _vec_str(query_embedding),
-        "qtext": query_text,
         "limit": limit,
     }
-
     if date_from:
-        base_conditions.append("end_date >= %(date_from)s")
+        conditions.append("end_date >= %(date_from)s")
         params["date_from"] = date_from
     if date_to:
-        base_conditions.append("start_date <= %(date_to)s")
+        conditions.append("start_date <= %(date_to)s")
         params["date_to"] = date_to
 
-    where = " AND ".join(base_conditions)
-
     sql = f"""
-    WITH
-    vec AS (
-        SELECT id,
-               ROW_NUMBER() OVER (ORDER BY embedding <=> %(emb)s::vector) AS rn
-        FROM   chunks
-        WHERE  {where}
-          AND  embedding IS NOT NULL
-        LIMIT  %(limit)s
-    ),
-    lex AS (
-        SELECT id,
-               ROW_NUMBER() OVER (
-                   ORDER BY ts_rank(tsv, websearch_to_tsquery('russian', %(qtext)s)) DESC
-               ) AS rn
-        FROM   chunks
-        WHERE  {where}
-          AND  tsv @@ websearch_to_tsquery('russian', %(qtext)s)
-        LIMIT  %(limit)s
-    ),
-    fused AS (
-        SELECT
-            COALESCE(vec.id, lex.id)                          AS id,
-            COALESCE(1.0 / (60.0 + vec.rn), 0.0)
-            + COALESCE(1.0 / (60.0 + lex.rn), 0.0)           AS score
-        FROM vec
-        FULL OUTER JOIN lex ON vec.id = lex.id
-    )
-    SELECT c.*
-    FROM   fused
-    JOIN   chunks c ON c.id = fused.id
-    ORDER  BY fused.score DESC
+    SELECT id, summary, message_ids, important_message_ids, first_message_id,
+           start_date, end_date,
+           embedding <=> %(emb)s::vector AS distance
+    FROM   chunks
+    WHERE  {" AND ".join(conditions)}
+    ORDER  BY distance
     LIMIT  %(limit)s
     """
 

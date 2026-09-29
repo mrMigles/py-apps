@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 import recap_db
+from recap_search import is_search_command_text
 
 logger = logging.getLogger("recap-bot.import")
 
@@ -136,6 +137,7 @@ def normalize_export_message(
     raw: dict,
     chat_id: int,
     chat_username: Optional[str],
+    bot_user_id: Optional[int] = None,
 ) -> Optional[dict]:
     """
     Normalise one raw Telegram Desktop export message dict into a DB row dict.
@@ -144,12 +146,14 @@ def normalize_export_message(
       - type != "message"
       - no text content after flattening
       - missing required fields (id, date)
+      - bot commands and search requests ("/…", "? …") and messages written
+        by this bot (bot_user_id) — they only echo searches back as results
     """
     if raw.get("type") != "message":
         return None
 
     text = _parse_export_text(raw.get("text", "")).strip()
-    if not text:
+    if not text or is_search_command_text(text):
         return None
 
     msg_id = raw.get("id")
@@ -161,6 +165,8 @@ def normalize_export_message(
         return None
 
     user_id = _parse_from_id(raw.get("from_id"))
+    if bot_user_id is not None and user_id == bot_user_id:
+        return None
     user_name = str(
         raw.get("from") or raw.get("actor") or f"User {user_id or msg_id}"
     )[:200]
@@ -237,6 +243,7 @@ def _collect_rows_sync(
     chat_id: int,
     chat_username: Optional[str],
     cancel_event: asyncio.Event,
+    bot_user_id: Optional[int] = None,
 ) -> List[dict]:
     """
     Synchronous: stream-parse the export file with ijson and return normalised
@@ -250,7 +257,7 @@ def _collect_rows_sync(
         for i, raw in enumerate(ijson.items(f, "messages.item")):
             if i % 500 == 0 and cancel_event.is_set():
                 break
-            row = normalize_export_message(raw, chat_id, chat_username)
+            row = normalize_export_message(raw, chat_id, chat_username, bot_user_id)
             if row:
                 rows.append(row)
     return rows
@@ -267,6 +274,7 @@ async def _run_import(
     file_name: str,
     status_msg,            # telegram.Message — edited for progress
     cancel_event: asyncio.Event,
+    bot_user_id: Optional[int] = None,
 ) -> None:
     """
     Full import pipeline:
@@ -286,7 +294,7 @@ async def _run_import(
         try:
             rows = await asyncio.to_thread(
                 _collect_rows_sync,
-                file_path, file_name, chat_id, chat_username, cancel_event,
+                file_path, file_name, chat_id, chat_username, cancel_event, bot_user_id,
             )
         except Exception as exc:
             logger.exception("Export parse error for chat_id=%s: %s", chat_id, exc)
@@ -557,6 +565,7 @@ async def on_import_document(update, context) -> None:
 
     cancel_ev = asyncio.Event()
     _cancel_events[chat_id] = cancel_ev
+    bot_id = getattr(context.bot, "id", None)
 
     task = asyncio.create_task(
         _run_import(
@@ -566,6 +575,7 @@ async def on_import_document(update, context) -> None:
             file_name=file_name,
             status_msg=status_msg,
             cancel_event=cancel_ev,
+            bot_user_id=bot_id if isinstance(bot_id, int) else None,
         )
     )
     _import_tasks[chat_id] = task

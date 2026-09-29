@@ -4,34 +4,42 @@
 /search command for the recap bot.
 
 Flow:
-  1. Guard: persistence must be enabled.
+  1. Guard: persistence and per-chat search must be enabled.
   2. LLM normalises the natural-language query to JSON filters
-     (query, date_from, date_to, participants, exact_terms).
-  3. Embed the normalised query string.
-  4. Hybrid retrieval: vector (cosine) + lexical (tsvector) with RRF merging,
-     scoped to the current chat_id and optional date range.
-  5. Optional LLM rerank of the top-5 candidate chunks.
-  6. Load the best chunk's original messages from DB.
-  7. LLM generates a grounded answer using only [id=N] markers (no HTML,
-     no SQL, no Telegram links).
-  8. Application converts [id=N] markers to validated HTML links, or to
-     plain-text "(#N)" references when the chat has no stable permalink
-     format (e.g. a basic, non-super group); unknown IDs are dropped.
-  9. Reply to the message the answer actually cites (falling back through
-     important/first/any chunk message) — old imported messages may no
-     longer exist in the live chat, so several candidates are tried.
+     (query, keywords, date_from, date_to, participants, exact_terms).
+  3. Full-text search over individual messages (messages.tsv): keywords are
+     sanitised into prefix terms and OR-ed together, so a message does not
+     have to contain every word of the question. Search commands and bot
+     messages are excluded — they only echo the question back.
+  4. Hits are clustered into discussions (hits close in time). A discussion
+     with several authors and good keyword coverage outranks a lone question
+     that merely mentions the same words.
+  5. Semantic fallback: nearest indexed chunks by embedding fill the list up
+     when full-text search finds few discussions.
+  6. One result at a time: the discussion window around the hits is loaded,
+     the LLM writes a short grounded answer using [id=N] markers, and an
+     excerpt of key messages with links is appended.
+  7. The result carries inline buttons «OK» (removes the buttons) and «Ещё»
+     (edits the same message with the next discussion). Only the user who
+     started the search may press them.
 
-Pure helpers (parse_search_filters, convert_id_markers_to_links) have no
-I/O and can be unit-tested without a database or LLM.
+Pure helpers (parse_search_filters, build_term_queries, cluster_hits,
+build_excerpt, convert_id_markers_to_links, …) have no I/O and can be
+unit-tested without a database or LLM.
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
-from typing import List, Optional
+import secrets
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
 import recap_db
 
@@ -130,7 +138,239 @@ def parse_search_filters(json_str: str) -> dict:
     if isinstance(exact_terms, list):
         result["exact_terms"] = [str(t)[:100] for t in exact_terms if t][:10]
 
+    keywords = data.get("keywords")
+    if isinstance(keywords, list):
+        result["keywords"] = [str(k)[:100] for k in keywords if k][:10]
+
     return result
+
+
+# Words that carry no topic: question words, "search verbs" and the most
+# common function words. Used for the no-LLM keyword fallback and to keep
+# them out of full-text terms (they would match nearly every message).
+_STOPWORDS = frozenset("""
+а без бы был была были было в вам вас ведь во вот все всё вы где да даже для
+до его ее её если есть еще ещё же за и из или им их к как какая какие какой
+когда кого кто ли либо мне мы на над не нет ни но ну о об обо он она они оно от
+по под при про с со так там тебе то тоже только ты у уже чем что чтобы эта эти
+это этот я
+зачем почему сколько откуда куда чей чья чьё чьи каким какую каком
+обсуждали обсуждал обсуждала обсуждение говорили говорил говорила писали писал
+писала упоминали упоминал спрашивал спрашивали речь было найди найти покажи
+вспомни напомни чате чат
+""".split())
+
+_QUESTION_WORDS = frozenset(
+    "кто что где когда как почему зачем какой какая какие какое сколько "
+    "куда откуда чей чья чьё чьи ли подскажите подскажи кто-нибудь "
+    "кто-то посоветуйте посоветуй".split()
+)
+
+_WORD_RE = re.compile(r"[^\W_]+(?:-[^\W_]+)*")
+
+
+def extract_keywords(query: str, limit: int = 8) -> List[str]:
+    """No-LLM fallback: the query's words minus stopwords/question words."""
+    words: List[str] = []
+    for w in _WORD_RE.findall(query.lower()):
+        if len(w) < 2 or w in _STOPWORDS or w in words:
+            continue
+        words.append(w)
+    return words[:limit]
+
+
+def build_term_queries(terms: List[str], limit: int = 10) -> List[str]:
+    """
+    Turn keywords/phrases into safe to_tsquery() fragments.
+
+    Each term is reduced to plain word tokens (letters/digits only, so no
+    tsquery operator or quote can ever reach PostgreSQL). Words of 3+ chars
+    become prefix terms ("поездку" → "поездку:*", stemmed by PostgreSQL to
+    'поездк':* and matching every form); a multi-word phrase becomes an AND
+    group. Duplicates and stopword-only terms are dropped.
+    """
+    fragments: List[str] = []
+    for term in terms:
+        tokens = [
+            t for t in re.findall(r"[^\W_]+", str(term).lower())
+            if len(t) >= 2 and t not in _STOPWORDS
+        ]
+        if not tokens:
+            continue
+        frag = " & ".join(f"{t}:*" if len(t) >= 3 else t for t in tokens)
+        if frag not in fragments:
+            fragments.append(frag)
+    return fragments[:limit]
+
+
+def build_or_tsquery(fragments: List[str]) -> str:
+    """OR the fragments together: a message needs only one of them to match."""
+    return " | ".join(f"({f})" for f in fragments)
+
+
+def is_search_command_text(text: Optional[str]) -> bool:
+    """True for bot commands and search requests ("/…", "? …")."""
+    s = (text or "").lstrip()
+    return s.startswith("/") or s.startswith("?")
+
+
+def looks_like_question(text: Optional[str]) -> bool:
+    """Heuristic: the message asks something rather than discusses it."""
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    if s.rstrip(")( .!").endswith("?"):
+        return True
+    first = _WORD_RE.match(s)
+    return bool(first and first.group(0) in _QUESTION_WORDS)
+
+
+def _canonical_id(m: dict) -> int:
+    return m.get("media_source_message_id") or m.get("message_id")
+
+
+@dataclass
+class Candidate:
+    """One found discussion: a time range plus the messages that matched."""
+    start: datetime
+    end: datetime
+    score: float = 0.0
+    hits: List[dict] = field(default_factory=list)
+    authors: List[str] = field(default_factory=list)
+    source: str = "fts"  # "fts" | "vector"
+
+    @property
+    def hit_ids(self) -> List[int]:
+        """Hit ids, best first: discussion messages before questions, then rank."""
+        ordered = sorted(
+            self.hits,
+            key=lambda h: (looks_like_question(h.get("text")), -(h.get("rank") or 0.0)),
+        )
+        return [_canonical_id(h) for h in ordered]
+
+
+QUESTION_PENALTY = 0.3
+
+
+def cluster_hits(
+    hits: List[dict],
+    n_terms: int,
+    gap: timedelta = timedelta(minutes=45),
+    participants: Optional[List[str]] = None,
+) -> List[Candidate]:
+    """
+    Group full-text hits into discussions and rank them.
+
+    Hits closer than *gap* to the previous hit belong to the same discussion.
+    Score = Σ rank (question-like hits count ×0.3)
+            × keyword coverage (distinct matched terms / n_terms)
+            × (1 + 0.5 per extra author)
+            × 0.3 if every hit is a question
+            × 1.5 if a requested participant took part.
+    So a real discussion outranks a lone "а кто знает про X?" message.
+    """
+    if not hits:
+        return []
+    ordered = sorted(hits, key=lambda h: (h["date"], h["message_id"]))
+    groups: List[List[dict]] = [[ordered[0]]]
+    for h in ordered[1:]:
+        if h["date"] - groups[-1][-1]["date"] > gap:
+            groups.append([h])
+        else:
+            groups[-1].append(h)
+
+    wanted = [p.lower() for p in (participants or []) if p]
+    candidates: List[Candidate] = []
+    for group in groups:
+        questions = [looks_like_question(h.get("text")) for h in group]
+        rank_sum = sum(
+            (h.get("rank") or 0.0) * (QUESTION_PENALTY if q else 1.0)
+            for h, q in zip(group, questions)
+        )
+        matched = set()
+        for h in group:
+            matched.update(h.get("matched_terms") or [])
+        coverage = len(matched) / n_terms if n_terms else 1.0
+        coverage = max(coverage, 1.0 / max(n_terms, 1))
+
+        authors: List[str] = []
+        for h in group:
+            name = h.get("user_name") or str(h.get("user_id") or "?")
+            if name not in authors:
+                authors.append(name)
+
+        score = rank_sum * coverage * (1.0 + 0.5 * (len(authors) - 1))
+        if all(questions):
+            score *= QUESTION_PENALTY
+        if wanted and any(
+            w in a.lower() for a in authors for w in wanted
+        ):
+            score *= 1.5
+
+        candidates.append(Candidate(
+            start=group[0]["date"],
+            end=group[-1]["date"],
+            score=score,
+            hits=group,
+            authors=authors,
+        ))
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates
+
+
+def _message_ref(mid: int, link_prefix: Optional[str]) -> str:
+    if not link_prefix:
+        return f"(#{mid})"
+    return f'<a href="{link_prefix}{mid}">#{mid}</a>'
+
+
+def build_excerpt(
+    window: List[dict],
+    hit_ids: List[int],
+    cited_ids: List[int],
+    link_prefix: Optional[str],
+    n: int = 4,
+    max_len: int = 200,
+) -> str:
+    """
+    HTML excerpt of the key messages of a discussion, in chronological order.
+
+    Picks cited messages first, then hits (discussion before questions, as
+    ordered by the caller), then — if still short — other window messages
+    after the first hit, i.e. the likely answers.
+    """
+    by_id = {_canonical_id(m): m for m in window}
+    picked: List[int] = []
+    for mid in list(cited_ids) + list(hit_ids):
+        if mid in by_id and mid not in picked:
+            picked.append(mid)
+        if len(picked) >= n:
+            break
+    if len(picked) < n and picked:
+        first = min(picked)
+        for m in window:
+            mid = _canonical_id(m)
+            if mid > first and mid not in picked:
+                picked.append(mid)
+                if len(picked) >= n:
+                    break
+    picked = picked[:n]
+
+    lines: List[str] = []
+    for m in window:
+        mid = _canonical_id(m)
+        if mid not in picked:
+            continue
+        text = " ".join((m.get("text") or "").split())
+        if len(text) > max_len:
+            text = text[: max_len - 1] + "…"
+        name = html.escape(m.get("user_name") or "?", quote=False)
+        lines.append(
+            f"▫️ <b>{name}</b>: {html.escape(text, quote=False)} "
+            f"{_message_ref(mid, link_prefix)}"
+        )
+    return "\n".join(lines)
 
 
 def ensure_citation(
@@ -195,9 +435,7 @@ def convert_id_markers_to_links(
         mid = int(m.group(1))
         if mid not in valid_ids:
             return ""
-        if not link_prefix:
-            return f"(#{mid})"
-        return f'<a href="{link_prefix}{mid}">#{mid}</a>'
+        return _message_ref(mid, link_prefix)
 
     text = re.sub(r"\[id=(\d+)\]", replace, text)
 
@@ -222,16 +460,17 @@ _NORMALISE_SYSTEM = (
     "Верни ТОЛЬКО JSON-объект без markdown, без HTML, без пояснений."
 )
 
-_NORMALISE_USER = """\
-Нормализуй запрос и извлеки фильтры. Верни JSON:
+_NORMALISE_USER = """Нормализуй запрос и извлеки фильтры. Верни JSON:
 {{
   "query": "нормализованный запрос по-русски (обязательно)",
+  "keywords": ["3–8 значимых слов или коротких фраз по теме, включая синонимы и другие написания (рус./англ.); БЕЗ вопросительных и служебных слов вроде «когда», «где», «кто», «обсуждали», «говорили»"],
   "date_from": "YYYY-MM-DD или null",
   "date_to":   "YYYY-MM-DD или null",
   "participants": ["имя1", "имя2"] или null,
   "exact_terms": ["точная фраза"] или null
 }}
 
+Сегодня: {today}
 Запрос пользователя: {query}"""
 
 
@@ -240,10 +479,13 @@ def _normalise_query_sync(query_text: str) -> str:
         model=RECAP_MODEL,
         messages=[
             {"role": "system", "content": _NORMALISE_SYSTEM},
-            {"role": "user", "content": _NORMALISE_USER.format(query=query_text)},
+            {"role": "user", "content": _NORMALISE_USER.format(
+                query=query_text,
+                today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            )},
         ],
         temperature=0.0,
-        max_tokens=200,
+        max_tokens=300,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -253,51 +495,17 @@ def _embed_sync(text: str) -> List[float]:
     return resp.data[0].embedding
 
 
-_RERANK_SYSTEM = (
-    "Ты ранжируешь результаты поиска по релевантности к запросу. "
-    "Верни ТОЛЬКО JSON-массив chunk_id (целые числа) в порядке убывания релевантности. "
-    "Не более 3 элементов. Без markdown, без пояснений."
-)
-
-
-def _rerank_sync(chunks: List[dict], query_text: str) -> List[dict]:
-    summaries = "\n".join(
-        f"[chunk_id={c['id']}] {c['summary']}" for c in chunks
-    )
-    user = f"Запрос: {query_text}\n\nРезультаты:\n{summaries}"
-    try:
-        resp = _get_client().chat.completions.create(
-            model=RECAP_MODEL,
-            messages=[
-                {"role": "system", "content": _RERANK_SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=80,
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw.rstrip())
-        ids = json.loads(raw.strip())
-        if isinstance(ids, list):
-            id_map = {c["id"]: c for c in chunks}
-            reranked = [id_map[i] for i in ids if i in id_map]
-            seen = {c["id"] for c in reranked}
-            rest = [c for c in chunks if c["id"] not in seen]
-            return reranked + rest
-    except Exception as exc:
-        logger.warning("Rerank failed (%s), using original order", exc)
-    return chunks
-
-
 _ANSWER_SYSTEM = (
     "Ты отвечаешь на вопросы по истории Telegram-чата. "
-    "Ответ — по-русски, кратко и по делу. "
+    "Тебе дан фрагмент обсуждения, найденный поиском. "
+    "Ответ — по-русски, 1–3 коротких предложения, по делу. "
+    "Опирайся на сообщения, где тему ОБСУЖДАЛИ или ДАЛИ ОТВЕТ, а не на "
+    "сообщения, где вопрос только задали. "
     "Ссылайся на источники, вставляя маркер [id=N] сразу после соответствующего "
     "факта, где N — id одного сообщения. "
     "НЕ перечисляй id списком и НЕ выводи id, если по теме ничего не нашлось. "
-    "Если ответа в предоставленных сообщениях нет — просто скажи об этом одним "
-    "предложением без каких-либо id. "
+    "Если во фрагменте тему только упомянули или спросили, но ответа нет — "
+    "так и скажи одним предложением. "
     "Не выдумывай — используй только предоставленные сообщения. "
     "Не генерируй HTML, SQL, Telegram-ссылки или код — только текст с маркерами [id=N]."
 )
@@ -340,7 +548,7 @@ def _generate_answer_sync(
 
 
 # ---------------------------------------------------------------------------
-# Telegram command handler
+# Search on/off commands
 # ---------------------------------------------------------------------------
 
 async def _can_manage_search(update, context) -> bool:
@@ -416,6 +624,212 @@ def extract_search_query(text: str) -> Optional[str]:
     return (match.group("query") or "").strip()
 
 
+# ---------------------------------------------------------------------------
+# Retrieval and rendering
+# ---------------------------------------------------------------------------
+
+MAX_RESULTS = 10
+MAX_ANSWER_CHARS = 1800
+
+
+async def find_discussions(
+    chat_id: int,
+    filters: dict,
+    query_text: str,
+    bot_id: Optional[int] = None,
+) -> List[Candidate]:
+    """
+    Full-text search over messages → discussion clusters, topped up with
+    semantic chunk matches that do not overlap an already found discussion.
+    """
+    norm_query = filters.get("query") or query_text
+    terms = list(filters.get("keywords") or []) + list(filters.get("exact_terms") or [])
+    fragments = build_term_queries(terms)
+    if not fragments:
+        fragments = build_term_queries(
+            extract_keywords(norm_query) or extract_keywords(query_text)
+        )
+
+    date_from: Optional[datetime] = filters.get("date_from")
+    date_to: Optional[datetime] = filters.get("date_to")
+
+    candidates: List[Candidate] = []
+    if fragments:
+        hits = await recap_db.search_messages(
+            chat_id=chat_id,
+            tsquery=build_or_tsquery(fragments),
+            term_queries=fragments,
+            date_from=date_from,
+            date_to=date_to,
+            exclude_user_id=bot_id,
+        )
+        candidates = cluster_hits(
+            hits, len(fragments), participants=filters.get("participants"),
+        )[:MAX_RESULTS]
+
+    if len(candidates) < MAX_RESULTS:
+        try:
+            embedding = await asyncio.to_thread(_embed_sync, norm_query)
+            chunks = await recap_db.vector_search_chunks(
+                chat_id, embedding, date_from=date_from, date_to=date_to,
+                limit=MAX_RESULTS,
+            )
+        except Exception as exc:
+            logger.warning("Semantic fallback failed (%s); full-text results only", exc)
+            chunks = []
+        for ch in chunks:
+            start, end = ch.get("start_date"), ch.get("end_date")
+            if not start or not end:
+                continue
+            if any(start <= c.end and end >= c.start for c in candidates):
+                continue
+            candidates.append(Candidate(start=start, end=end, source="vector"))
+            if len(candidates) >= MAX_RESULTS:
+                break
+
+    return candidates
+
+
+async def render_candidate(
+    chat_id: int,
+    candidate: Candidate,
+    query_text: str,
+    link_prefix: Optional[str],
+    position: int,
+    total: int,
+    bot_id: Optional[int] = None,
+) -> str:
+    """Load the discussion window and build the HTML text of one result."""
+    window = await recap_db.get_context_window(
+        chat_id, candidate.start, candidate.end, exclude_user_id=bot_id
+    )
+    if not window:
+        return f"🔎 Результат {position}/{total}: не удалось загрузить сообщения."
+
+    valid_ids = {_canonical_id(m) for m in window}
+    hit_ids = [mid for mid in candidate.hit_ids if mid in valid_ids]
+    if not hit_ids:
+        # Semantic candidates have no hits: prefer the window's non-questions.
+        hit_ids = [
+            _canonical_id(m) for m in sorted(
+                window, key=lambda m: looks_like_question(m.get("text"))
+            )
+        ]
+
+    try:
+        raw_answer = await asyncio.to_thread(_generate_answer_sync, window, query_text)
+    except Exception as exc:
+        logger.warning("Answer generation failed (%s); showing excerpt only", exc)
+        raw_answer = ""
+    raw_answer = (raw_answer or "")[:MAX_ANSWER_CHARS]
+    if raw_answer:
+        raw_answer = ensure_citation(raw_answer, hit_ids)
+    cited_ids = extract_cited_ids(raw_answer, valid_ids)
+    answer_html = convert_id_markers_to_links(
+        html.escape(raw_answer, quote=False), link_prefix, valid_ids
+    )
+
+    authors = list(candidate.authors)
+    if not authors:
+        for m in window:
+            name = m.get("user_name") or "?"
+            if name not in authors:
+                authors.append(name)
+    header = (
+        f"🔎 <b>Результат {position}/{total}</b> · "
+        f"{candidate.start.strftime('%d.%m.%Y')} · "
+        f"{html.escape(', '.join(authors[:3]), quote=False)}"
+    )
+    parts = [header]
+    if answer_html:
+        parts.append(answer_html)
+    excerpt = build_excerpt(window, hit_ids, cited_ids, link_prefix)
+    if excerpt:
+        parts.append(excerpt)
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Result sessions (pagination state behind the inline buttons)
+# ---------------------------------------------------------------------------
+
+SESSION_TTL_SECONDS = 24 * 3600
+MAX_SESSIONS = 200
+CALLBACK_PREFIX = "srch"
+
+
+@dataclass
+class SearchSession:
+    token: str
+    chat_id: int
+    user_id: Optional[int]
+    query: str
+    link_prefix: Optional[str]
+    candidates: List[Candidate]
+    bot_id: Optional[int] = None
+    index: int = 0
+    pages: Dict[int, str] = field(default_factory=dict)
+    busy: bool = False
+    created: float = field(default_factory=time.monotonic)
+
+
+# In memory only: after a restart the buttons answer «Поиск устарел».
+_SESSIONS: "OrderedDict[str, SearchSession]" = OrderedDict()
+
+
+def _new_session(**kwargs) -> SearchSession:
+    now = time.monotonic()
+    for token in [t for t, s in _SESSIONS.items() if now - s.created > SESSION_TTL_SECONDS]:
+        _SESSIONS.pop(token, None)
+    while len(_SESSIONS) >= MAX_SESSIONS:
+        _SESSIONS.popitem(last=False)
+    token = secrets.token_urlsafe(6)
+    while token in _SESSIONS:
+        token = secrets.token_urlsafe(6)
+    session = SearchSession(token=token, **kwargs)
+    _SESSIONS[token] = session
+    return session
+
+
+def _get_session(token: str) -> Optional[SearchSession]:
+    session = _SESSIONS.get(token)
+    if session and time.monotonic() - session.created > SESSION_TTL_SECONDS:
+        _SESSIONS.pop(token, None)
+        return None
+    return session
+
+
+def _keyboard(session: SearchSession):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    buttons = [InlineKeyboardButton(
+        "👌 OK", callback_data=f"{CALLBACK_PREFIX}:{session.token}:ok"
+    )]
+    if session.index < len(session.candidates) - 1:
+        buttons.append(InlineKeyboardButton(
+            "➡️ Ещё", callback_data=f"{CALLBACK_PREFIX}:{session.token}:more"
+        ))
+    return InlineKeyboardMarkup([buttons])
+
+
+async def _render_page(session: SearchSession, index: int) -> str:
+    if index not in session.pages:
+        session.pages[index] = await render_candidate(
+            session.chat_id,
+            session.candidates[index],
+            session.query,
+            session.link_prefix,
+            index + 1,
+            len(session.candidates),
+            bot_id=session.bot_id,
+        )
+    return session.pages[index]
+
+
+# ---------------------------------------------------------------------------
+# Telegram handlers
+# ---------------------------------------------------------------------------
+
 async def cmd_search(update, context) -> None:
     """Handle /search, /s, /п and ? search requests."""
     from telegram.constants import ParseMode
@@ -454,13 +868,14 @@ async def cmd_search(update, context) -> None:
         )
         return
     chat_id = chat.id
-    chat_username = getattr(chat, "username", None)
-    prefix = _link_prefix(chat_id, chat_username)
+    prefix = _link_prefix(chat_id, getattr(chat, "username", None))
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    bot_id = getattr(context.bot, "id", None)
+    bot_id = bot_id if isinstance(bot_id, int) else None
 
     processing_msg = await msg.reply_text("Ищу…")
 
     try:
-        # 1. Normalise the query
         try:
             raw_filters = await asyncio.to_thread(_normalise_query_sync, query_text)
             filters = parse_search_filters(raw_filters)
@@ -468,140 +883,29 @@ async def cmd_search(update, context) -> None:
             logger.warning("Query normalisation failed (%s), using raw query", exc)
             filters = {"query": query_text}
 
-        norm_query = filters.get("query") or query_text
-        date_from: Optional[datetime] = filters.get("date_from")
-        date_to: Optional[datetime] = filters.get("date_to")
-
-        # 2. Embed
-        try:
-            query_embedding = await asyncio.to_thread(_embed_sync, norm_query)
-        except Exception as exc:
-            logger.exception("Embedding failed: %s", exc)
-            await processing_msg.edit_text("Не удалось обработать запрос (embedding).")
-            return
-
-        # 3. Hybrid retrieval
-        chunks = await recap_db.hybrid_search(
-            chat_id=chat_id,
-            query_embedding=query_embedding,
-            query_text=norm_query,
-            date_from=date_from,
-            date_to=date_to,
-            limit=10,
+        candidates = await find_discussions(
+            chat_id, filters, query_text,
+            bot_id=bot_id,
         )
-
-        if not chunks:
+        if not candidates:
             await processing_msg.edit_text("По этому запросу ничего не найдено.")
             return
 
-        # 4. Rerank top candidates
-        if len(chunks) > 1:
-            try:
-                chunks = await asyncio.to_thread(_rerank_sync, chunks[:5], norm_query)
-            except Exception as exc:
-                logger.warning("Rerank error: %s", exc)
-
-        best = chunks[0]
-        chunk_message_ids: List[int] = list(best.get("message_ids") or [])
-
-        # 5. Load messages
-        messages = await recap_db.get_chunk_messages(chat_id, chunk_message_ids)
-        if not messages:
-            await processing_msg.edit_text("Не удалось загрузить сообщения фрагмента.")
-            return
-
-        # Build the set of valid citation IDs (canonical: media source if set)
-        valid_ids: set = set()
-        canonical_id_by_message_id: dict = {}
-        for m in messages:
-            canonical = m.get("media_source_message_id") or m.get("message_id")
-            valid_ids.add(canonical)
-            canonical_id_by_message_id[m.get("message_id")] = canonical
-
-        # 6. Generate grounded answer
-        try:
-            raw_answer = await asyncio.to_thread(
-                _generate_answer_sync, messages, norm_query
-            )
-        except Exception as exc:
-            logger.exception("Answer generation failed: %s", exc)
-            await processing_msg.edit_text("Не удалось сформировать ответ.")
-            return
-
-        # 6b. Guarantee at least one citation, using the chunk's LLM-flagged
-        # important messages first, falling back to the discussion's first
-        # message, so the answer never ends up without a source link.
-        fallback_ids: List[int] = [
-            canonical_id_by_message_id[m]
-            for m in (best.get("important_message_ids") or [])
-            if m in canonical_id_by_message_id
-        ]
-        first_mid_fallback = canonical_id_by_message_id.get(best.get("first_message_id"))
-        if first_mid_fallback and first_mid_fallback not in fallback_ids:
-            fallback_ids.append(first_mid_fallback)
-        raw_answer = ensure_citation(raw_answer, fallback_ids)
-
-        # 7. Reply-to candidates: the ids the answer actually cites (most
-        # relevant), then the fallback ids, then the chunk's first message,
-        # then any other message in the chunk — tried in this order below
-        # since imported/historical messages can be missing from the live
-        # chat (deleted, or the chat never actually reaches back that far).
-        cited_ids = extract_cited_ids(raw_answer, valid_ids)
-        first_mid_canonical = canonical_id_by_message_id.get(best.get("first_message_id"))
-        reply_candidates: List[int] = []
-        seen_candidates: set = set()
-
-        def _add_candidate(mid: Optional[int]) -> None:
-            if mid and mid not in seen_candidates:
-                seen_candidates.add(mid)
-                reply_candidates.append(mid)
-
-        for mid in cited_ids:
-            _add_candidate(mid)
-        for mid in fallback_ids:
-            _add_candidate(mid)
-        _add_candidate(first_mid_canonical)
-        for m in messages:
-            _add_candidate(m.get("media_source_message_id") or m.get("message_id"))
-
-        # 8. Convert [id=N] markers to validated HTML links (or plain-text
-        # "(#N)" references when this chat has no stable permalink format).
-        answer_html = convert_id_markers_to_links(raw_answer, prefix, valid_ids)
-        answer_html = answer_html.strip() or "Ответ не сформирован."
-
-        # 9. Delete "Ищу…" message and send the answer
-        try:
-            await processing_msg.delete()
-        except Exception:
-            pass
-
-        send_kwargs = dict(
+        session = _new_session(
             chat_id=chat_id,
-            text=answer_html,
+            user_id=user_id if isinstance(user_id, int) else None,
+            query=query_text,
+            link_prefix=prefix,
+            candidates=candidates,
+            bot_id=bot_id,
+        )
+        text = await _render_page(session, 0)
+        await processing_msg.edit_text(
+            text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+            reply_markup=_keyboard(session),
         )
-
-        sent = False
-        for candidate in reply_candidates[:6]:
-            try:
-                await context.bot.send_message(reply_to_message_id=candidate, **send_kwargs)
-                sent = True
-                break
-            except Exception as exc:
-                logger.debug(
-                    "Reply to message_id=%s failed (%s); trying next candidate",
-                    candidate, exc,
-                )
-
-        if not sent:
-            if reply_candidates:
-                logger.warning(
-                    "Could not reply to any of %s candidate messages for chat_id=%s; "
-                    "sending without reply",
-                    len(reply_candidates[:6]), chat_id,
-                )
-            await context.bot.send_message(**send_kwargs)
 
     except Exception as exc:
         logger.exception("Search error: %s", exc)
@@ -609,3 +913,67 @@ async def cmd_search(update, context) -> None:
             await processing_msg.edit_text("Произошла ошибка при поиске.")
         except Exception:
             pass
+
+
+async def on_search_callback(update, context) -> None:
+    """Handle the «OK» / «Ещё» buttons under a search result."""
+    from telegram.constants import ParseMode
+
+    query = update.callback_query
+    if not query:
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != CALLBACK_PREFIX:
+        await query.answer()
+        return
+    _, token, action = parts
+
+    session = _get_session(token)
+    message = getattr(query, "message", None)
+    if session is None or (
+        message is not None and getattr(message, "chat_id", None) != session.chat_id
+    ):
+        await query.answer("Поиск устарел, повторите запрос.", show_alert=True)
+        return
+
+    from_user = getattr(query, "from_user", None)
+    if session.user_id is not None and getattr(from_user, "id", None) != session.user_id:
+        await query.answer("Кнопки доступны только автору поиска.", show_alert=True)
+        return
+
+    if action == "ok":
+        await query.answer()
+        _SESSIONS.pop(token, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as exc:
+            logger.debug("Could not remove search keyboard: %s", exc)
+        return
+
+    if action != "more":
+        await query.answer()
+        return
+
+    if session.busy:
+        await query.answer("Ищу, подождите…")
+        return
+    if session.index >= len(session.candidates) - 1:
+        await query.answer("Больше результатов нет.")
+        return
+
+    session.busy = True
+    try:
+        await query.answer()
+        next_index = session.index + 1
+        text = await _render_page(session, next_index)
+        session.index = next_index
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=_keyboard(session),
+        )
+    except Exception as exc:
+        logger.exception("Search pagination error: %s", exc)
+    finally:
+        session.busy = False

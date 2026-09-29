@@ -43,8 +43,10 @@ from typing import Dict, List, Optional, Tuple
 from openai import OpenAI
 from telegram import Message, Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
   ApplicationBuilder,
+  CallbackQueryHandler,
   CommandHandler,
   ContextTypes,
   MessageHandler,
@@ -852,6 +854,30 @@ async def on_voice_or_video_note(update: Update, context: ContextTypes.DEFAULT_T
   )
 
 
+async def _build_recap(msg: Message, chat) -> str:
+  """
+  Recap HTML for a /recap-style request: from the replied-to message when the
+  command is a reply, otherwise everything kept in memory for the last day.
+  Returns a plain notice when there is nothing to recap.
+  """
+  chat_id = chat.id
+  prefix = _link_prefix(chat_id, getattr(chat, "username", None))
+  reply = msg.reply_to_message
+  start_id = reply.message_id if reply else None
+  if start_id:
+    logger.info("Recap starting from message_id=%s", start_id)
+
+  async with history_lock:
+    messages = _select_slice_for_recap(chat_id, from_message_id=start_id)
+
+  if not messages:
+    if start_id:
+      return "Не нашёл сообщений начиная с этого реплая за последние сутки."
+    return "В памяти за последние сутки нет сообщений для рекапа."
+
+  return await _summarize_conversation_narrative(messages, prefix)
+
+
 async def cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   """Handle /recap command."""
   msg = update.effective_message
@@ -860,49 +886,77 @@ async def cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   if not chat or not msg:
     return
 
-  chat_id = chat.id
-  chat_username = getattr(chat, "username", None)
-  prefix = _link_prefix(chat_id, chat_username)
-
   logger.info(
       "Received /recap in chat_id=%s msg_id=%s is_reply=%s",
-      chat_id,
+      chat.id,
       msg.message_id,
       bool(msg.reply_to_message),
   )
 
-  if not msg.reply_to_message:
-    async with history_lock:
-      messages = _select_slice_for_recap(chat_id, from_message_id=None)
-
-    if not messages:
-      await msg.reply_text("В памяти за последние сутки нет сообщений для рекапа.")
-      return
-
-    recap_html = await _summarize_conversation_narrative(messages, prefix)
-    await msg.reply_text(
-        recap_html,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    return
-
-  start_id = msg.reply_to_message.message_id
-  logger.info("Recap starting from message_id=%s", start_id)
-
-  async with history_lock:
-    messages = _select_slice_for_recap(chat_id, from_message_id=start_id)
-
-  if not messages:
-    await msg.reply_text("Не нашёл сообщений начиная с этого реплая за последние сутки.")
-    return
-
-  recap_html = await _summarize_conversation_narrative(messages, prefix)
+  recap_html = await _build_recap(msg, chat)
   await msg.reply_text(
       recap_html,
       parse_mode=ParseMode.HTML,
       disable_web_page_preview=True,
   )
+
+
+async def cmd_private_recap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  """
+  Handle /privaterecap: the same recap as /recap, but delivered to the
+  requester's direct messages, and the request itself is removed from the chat.
+  """
+  msg = update.effective_message
+  chat = update.effective_chat
+  user = update.effective_user
+
+  if not chat or not msg or not user:
+    return
+
+  logger.info(
+      "Received /privaterecap in chat_id=%s msg_id=%s from user_id=%s is_reply=%s",
+      chat.id,
+      msg.message_id,
+      user.id,
+      bool(msg.reply_to_message),
+  )
+
+  in_group = chat.type != "private"
+  if in_group:
+    # Remove the request right away so the chat does not see it. Needs the
+    # "delete messages" admin right; without it the recap is still sent.
+    try:
+      await msg.delete()
+    except TelegramError as exc:
+      logger.warning(
+          "Could not delete /privaterecap request chat_id=%s msg_id=%s: %s",
+          chat.id, msg.message_id, exc,
+      )
+
+  recap_html = await _build_recap(msg, chat)
+  if in_group:
+    title = html.escape(chat.title or chat.username or str(chat.id), quote=False)
+    recap_html = f"Рекап чата «{title}»:\n\n{recap_html}"
+
+  try:
+    await context.bot.send_message(
+        chat_id=user.id,
+        text=recap_html,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+  except TelegramError as exc:
+    # Typically Forbidden: the user never opened a dialog with the bot.
+    logger.warning("Could not send private recap to user_id=%s: %s", user.id, exc)
+    if in_group:
+      await context.bot.send_message(
+          chat_id=chat.id,
+          text=(
+              f"{user.mention_html()}, не могу написать в личку: "
+              "откройте диалог со мной, нажмите /start и повторите /privaterecap."
+          ),
+          parse_mode=ParseMode.HTML,
+      )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -911,9 +965,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     "1) Пролистай чат до первого непрочитанного сообщения.\n"
     "2) Ответь на него реплаем с командой /recap.\n"
     "3) Я возьму сообщения с него за последние сутки и сделаю живой пересказ.\n\n"
+    "/privaterecap — то же самое, но рекап придёт в личные сообщения, а сама "
+    "команда удалится из чата (для этого откройте диалог с ботом и нажмите /start).\n\n"
     "Поиск по истории: администратор включает его командой /search_on и "
     "выключает командой /search_off. Затем доступны /search запрос, /s запрос, "
-    "/п запрос или ? запрос.\n\n"
+    "/п запрос или ? запрос. Под результатом: «OK» — убрать кнопки, "
+    "«Ещё» — следующее найденное обсуждение (кнопки — только для автора поиска).\n\n"
     "Важно: для работы в группах у бота должен быть выключен privacy mode, "
     "и бот должен быть добавлен в группу после изменения настройки."
   )
@@ -975,27 +1032,28 @@ async def _post_shutdown(application) -> None:
 # ==========================
 
 
-def main() -> None:
-  if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment.")
-  if not OPENAI_TOKEN:
-    raise RuntimeError("OPENAI_TOKEN is not set in environment.")
-
-  logger.info("Starting recap bot")
-  application = (
+def build_application(token: str, request=None, get_updates_request=None):
+  """Create the Application with all handlers (custom requests are used by e2e tests)."""
+  builder = (
       ApplicationBuilder()
-      .token(TELEGRAM_BOT_TOKEN)
+      .token(token)
       .post_init(_post_init)
       .post_shutdown(_post_shutdown)
-      .build()
   )
+  if request is not None:
+    builder = builder.request(request)
+  if get_updates_request is not None:
+    builder = builder.get_updates_request(get_updates_request)
+  application = builder.build()
 
   application.add_handler(
       MessageHandler(filters.ALL, debug_raw),
       group=-100,
   )
 
+  application.add_handler(CommandHandler("start", cmd_help))
   application.add_handler(CommandHandler("recap", cmd_recap))
+  application.add_handler(CommandHandler("privaterecap", cmd_private_recap))
   application.add_handler(CommandHandler("help", cmd_help))
   application.add_handler(CommandHandler("search_on", recap_search.cmd_search_on))
   application.add_handler(CommandHandler("search_off", recap_search.cmd_search_off))
@@ -1010,6 +1068,12 @@ def main() -> None:
           recap_search.cmd_search,
       )
   )
+  application.add_handler(
+      CallbackQueryHandler(
+          recap_search.on_search_callback,
+          pattern=rf"^{recap_search.CALLBACK_PREFIX}:",
+      )
+  )
 
   application.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, on_voice_or_video_note))
   application.add_handler(MessageHandler(filters.PHOTO, on_photo))
@@ -1019,7 +1083,17 @@ def main() -> None:
   application.add_handler(MessageHandler(~filters.COMMAND, on_regular_message))
 
   application.add_error_handler(error_handler)
+  return application
 
+
+def main() -> None:
+  if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment.")
+  if not OPENAI_TOKEN:
+    raise RuntimeError("OPENAI_TOKEN is not set in environment.")
+
+  logger.info("Starting recap bot")
+  application = build_application(TELEGRAM_BOT_TOKEN)
   application.run_polling(allowed_updates=Update.ALL_TYPES)
   logger.info("Bot stopped")
 

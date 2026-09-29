@@ -5,7 +5,7 @@ A small collection of independent, Russian-language Telegram bots. Each applicat
 ## Applications
 
 - [`vkthief`](vkthief/) — downloads short videos from VK, YouTube Shorts, TikTok, and Rutube and sends them to a Telegram chat.
-- [`recap`](recap/) — keeps a rolling in-memory chat history, transcribes voice messages, and creates Russian-language chat recaps through an OpenAI-compatible API. Optionally stores full message history in PostgreSQL/pgvector, indexes it into semantically coherent chunks, and provides `/search` for hybrid vector + lexical retrieval. Includes `/init` to import Telegram Desktop JSON exports.
+- [`recap`](recap/) — keeps a rolling in-memory chat history, transcribes voice messages, and creates Russian-language chat recaps through an OpenAI-compatible API. Optionally stores full message history in PostgreSQL/pgvector, indexes it into semantically coherent chunks, and provides `/search`: message-level full-text search that finds the discussion (not just the question), with a semantic fallback and «OK»/«Ещё» result paging. `/privaterecap` sends the recap to direct messages and removes the request. Includes `/init` to import Telegram Desktop JSON exports.
 
 ## Quick start
 
