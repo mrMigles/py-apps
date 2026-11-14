@@ -1,8 +1,12 @@
+import pathlib
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from vkthief import vkthief
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+import vkthief  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -82,6 +86,195 @@ def test_download_video_uses_downloaded_file(monkeypatch, tmp_path):
     assert description == "Описание"
     assert captured_options["noplaylist"] is True
     assert captured_options["max_filesize"] == vkthief.MAX_FILE_MB * 1024 * 1024
+
+
+COOKIE_LINE = ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tsecret"
+
+
+def make_fake_youtube_dl(video_path, captured):
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured["options"] = dict(options)
+            cookie_file = options.get("cookiefile")
+            captured["cookies"] = (
+                vkthief.Path(cookie_file).read_text(encoding="utf-8") if cookie_file else None
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, url, download):
+            return {"requested_downloads": [{"filepath": str(video_path)}]}
+
+    return FakeYoutubeDL
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://youtube.com/shorts/abc", True),
+        ("https://www.youtube.com/shorts/abc", True),
+        ("https://m.youtube.com/shorts/abc", True),
+        ("https://music.youtube.com/watch?v=abc", True),
+        ("https://youtu.be/abc", True),
+        ("https://www.youtube-nocookie.com/embed/abc", True),
+        ("https://notyoutube.com/shorts/abc", False),
+        ("https://youtube.com.evil.test/shorts/abc", False),
+        ("https://vk.com/clip-1_2", False),
+    ],
+)
+def test_is_youtube_url(url, expected):
+    assert vkthief.is_youtube_url(url) is expected
+
+
+def test_load_youtube_cookies_empty():
+    assert vkthief.load_youtube_cookies("") is None
+    assert vkthief.load_youtube_cookies("   ") is None
+
+
+def test_load_youtube_cookies_from_file(tmp_path):
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text(
+        "# Netscape HTTP Cookie File\n# comment\n\n" + COOKIE_LINE + "\n", encoding="utf-8"
+    )
+
+    assert vkthief.load_youtube_cookies(str(cookie_path)) == (
+        "# Netscape HTTP Cookie File\n" + COOKIE_LINE + "\n"
+    )
+
+
+def test_load_youtube_cookies_from_content_adds_header_and_keeps_httponly():
+    httponly = "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tHSID\tx"
+    result = vkthief.load_youtube_cookies(COOKIE_LINE + "\n" + httponly)
+
+    assert result == "# Netscape HTTP Cookie File\n" + COOKIE_LINE + "\n" + httponly + "\n"
+
+
+def test_load_youtube_cookies_repairs_escaped_newlines_and_lost_tabs():
+    spaced = COOKIE_LINE.replace("\t", " ")
+    empty_value = ".youtube.com TRUE / FALSE 0 PREF"
+    result = vkthief.load_youtube_cookies(spaced + "\\n" + empty_value)
+
+    assert result == (
+        "# Netscape HTTP Cookie File\n"
+        + COOKIE_LINE
+        + "\n.youtube.com\tTRUE\t/\tFALSE\t0\tPREF\t\n"
+    )
+
+
+def test_load_youtube_cookies_rejects_garbage_and_missing_file(tmp_path):
+    assert vkthief.load_youtube_cookies("not cookies at all") is None
+    assert vkthief.load_youtube_cookies(str(tmp_path / "missing.txt")) is None
+
+
+def test_load_youtube_cookies_strips_bom(tmp_path):
+    cookie_path = tmp_path / "cookies.txt"
+    cookie_path.write_text("﻿# Netscape HTTP Cookie File\n" + COOKIE_LINE, encoding="utf-8")
+
+    assert COOKIE_LINE in vkthief.load_youtube_cookies(str(cookie_path))
+
+
+def test_load_youtube_cookies_logs_missing_file(tmp_path, caplog):
+    missing = tmp_path / "missing.txt"
+
+    assert vkthief.load_youtube_cookies(str(missing)) is None
+    assert "YOUTUBE_COOKIES file not found" in caplog.text
+
+
+def test_summarize_youtube_cookies_detects_login_and_expired():
+    expired = ".youtube.com\tTRUE\t/\tTRUE\t1000\tLOGIN_INFO\told"
+    session = ".youtube.com\tTRUE\t/\tFALSE\t0\tPREF\tx"
+    text = vkthief.normalize_netscape_cookies("\n".join([COOKIE_LINE, expired, session]))
+
+    assert vkthief.summarize_youtube_cookies(text) == {
+        "count": 3,
+        "expired": 1,
+        "logged_in": True,  # SID is still valid
+        "login_cookies": ["LOGIN_INFO", "SID"],
+    }
+
+    only_expired = vkthief.normalize_netscape_cookies(expired + "\n" + session)
+    assert vkthief.summarize_youtube_cookies(only_expired)["logged_in"] is False
+
+
+def test_log_youtube_cookies_status(monkeypatch, caplog):
+    caplog.set_level("INFO")
+
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", "")
+    assert vkthief.log_youtube_cookies_status() is False
+    assert "YOUTUBE_COOKIES is not set" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", COOKIE_LINE)
+    assert vkthief.log_youtube_cookies_status() is True
+    assert "YouTube cookies loaded successfully: 1 cookies, 0 expired, login cookies: SID" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", ".youtube.com\tTRUE\t/\tFALSE\t0\tPREF\tx")
+    assert vkthief.log_youtube_cookies_status() is True
+    assert "no valid login cookies" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", "garbage that is not cookies at all ok")
+    assert vkthief.log_youtube_cookies_status() is False
+    assert "neither an existing file nor valid Netscape cookies" in caplog.text
+
+
+def test_download_video_routes_yt_dlp_warnings_to_log(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(
+        vkthief, "YoutubeDL", make_fake_youtube_dl(tmp_path / "video.mp4", captured)
+    )
+
+    vkthief.download_video("https://vk.com/clip-1_2", tmp_path)
+
+    assert captured["options"]["logger"] is vkthief.YT_DLP_LOGGER
+
+
+def test_download_video_passes_private_cookie_copy_for_youtube(monkeypatch, tmp_path):
+    source = tmp_path / "source_cookies.txt"
+    source.write_text(COOKIE_LINE + "\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    captured = {}
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", str(source))
+    monkeypatch.setattr(
+        vkthief, "YoutubeDL", make_fake_youtube_dl(work_dir / "video.mp4", captured)
+    )
+
+    vkthief.download_video("https://m.youtube.com/shorts/abc", work_dir)
+
+    cookie_file = vkthief.Path(captured["options"]["cookiefile"])
+    assert cookie_file.parent == work_dir
+    assert cookie_file != source
+    assert captured["cookies"] == "# Netscape HTTP Cookie File\n" + COOKIE_LINE + "\n"
+
+
+def test_download_video_skips_cookies_for_other_sites(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", COOKIE_LINE)
+    monkeypatch.setattr(
+        vkthief, "YoutubeDL", make_fake_youtube_dl(tmp_path / "video.mp4", captured)
+    )
+
+    vkthief.download_video("https://vk.com/clip-1_2", tmp_path)
+
+    assert "cookiefile" not in captured["options"]
+
+
+def test_download_video_without_cookies_env(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", "")
+    monkeypatch.setattr(
+        vkthief, "YoutubeDL", make_fake_youtube_dl(tmp_path / "video.mp4", captured)
+    )
+
+    vkthief.download_video("https://youtube.com/shorts/abc", tmp_path)
+
+    assert "cookiefile" not in captured["options"]
 
 
 @pytest.mark.asyncio

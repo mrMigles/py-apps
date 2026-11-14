@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,6 +24,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "49"))
 MAX_CAPTION_LENGTH = 1024
 VIDEO_WORKER_COUNT = max(1, int(os.environ.get("VIDEO_WORKER_COUNT", "10")))
+# Netscape-format cookies.txt for YouTube: either a path to the file or the file contents itself.
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
+NETSCAPE_COOKIE_HEADER = "# Netscape HTTP Cookie File"
+NETSCAPE_COOKIE_FIELDS = 7
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+# Present only when the Google account is signed in.
+YOUTUBE_LOGIN_COOKIES = frozenset({"LOGIN_INFO", "SID", "__Secure-1PSID", "__Secure-3PSID"})
+# yt-dlp sends its progress to logger.debug, warnings to .warning, errors to .error.
+YT_DLP_LOGGER = logging.getLogger("yt_dlp")
 VIDEO_TASK_QUEUE_KEY = "video_task_queue"
 VIDEO_CHAT_LOCKS_KEY = "video_chat_locks"
 VIDEO_WORKER_TASKS_KEY = "video_worker_tasks"
@@ -122,6 +132,123 @@ def format_video_caption(description: str | None) -> str | None:
     return caption[: MAX_CAPTION_LENGTH - 3].rstrip() + "..."
 
 
+def is_youtube_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    # Covers youtube.com, www./m./music.youtube.com, youtu.be, www.youtube-nocookie.com.
+    return any(hostname == host or hostname.endswith("." + host) for host in YOUTUBE_HOSTS)
+
+
+def load_youtube_cookies(value: str | None = None) -> str | None:
+    """Return Netscape cookies.txt text from YOUTUBE_COOKIES (a file path or the contents)."""
+    value = (YOUTUBE_COOKIES if value is None else value).strip()
+    if not value:
+        return None
+
+    if "\n" not in value and "\t" not in value:
+        cookie_path = Path(value).expanduser()
+        try:
+            if cookie_path.is_file():
+                # Re-read on every download so the file can be refreshed without a restart.
+                value = cookie_path.read_text(encoding="utf-8-sig")
+            elif len(value.split()) < NETSCAPE_COOKIE_FIELDS - 1:
+                # Too few fields to be even one cookie line, so it must be a path.
+                logging.warning("YOUTUBE_COOKIES file not found: %s", cookie_path)
+                return None
+        except (OSError, ValueError):
+            pass  # too long / invalid for a path: treat it as the cookie contents
+
+    return normalize_netscape_cookies(value)
+
+
+def summarize_youtube_cookies(cookies_text: str) -> dict:
+    now = time.time()
+    names, expired = set(), set()
+    for line in cookies_text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != NETSCAPE_COOKIE_FIELDS:
+            continue
+        name = fields[5]
+        names.add(name)
+        try:
+            expires = int(fields[4])
+        except ValueError:
+            expires = 0
+        if 0 < expires < now:  # 0 means a session cookie
+            expired.add(name)
+
+    login_cookies = names & YOUTUBE_LOGIN_COOKIES
+    return {
+        "count": len(names),
+        "expired": len(expired),
+        "logged_in": bool(login_cookies - expired),
+        "login_cookies": sorted(login_cookies),
+    }
+
+
+def log_youtube_cookies_status() -> bool:
+    """Log at startup whether YOUTUBE_COOKIES is usable. Returns True if cookies were loaded."""
+    if not YOUTUBE_COOKIES.strip():
+        logging.info("YOUTUBE_COOKIES is not set, YouTube is downloaded without cookies")
+        return False
+
+    cookies_text = load_youtube_cookies()
+    if not cookies_text:
+        return False  # load_youtube_cookies already logged why
+
+    summary = summarize_youtube_cookies(cookies_text)
+    if summary["logged_in"]:
+        logging.info(
+            "YouTube cookies loaded successfully: %s cookies, %s expired, login cookies: %s",
+            summary["count"],
+            summary["expired"],
+            ", ".join(summary["login_cookies"]),
+        )
+    else:
+        logging.warning(
+            "YouTube cookies loaded (%s cookies, %s expired), but there are no valid login "
+            "cookies (%s): the account is not signed in or the cookies have expired",
+            summary["count"],
+            summary["expired"],
+            ", ".join(sorted(YOUTUBE_LOGIN_COOKIES)),
+        )
+    return True
+
+
+def normalize_netscape_cookies(text: str) -> str | None:
+    # Env values often lose real newlines/tabs: accept literal "\n"/"\t" and whitespace-separated fields.
+    if "\n" not in text and "\\n" in text:
+        text = text.replace("\\n", "\n")
+    text = text.replace("\\t", "\t")
+
+    cookie_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip("\r\n")
+        if not line.strip():
+            continue
+        # "#HttpOnly_" lines are real cookies, other "#" lines are comments.
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != NETSCAPE_COOKIE_FIELDS:
+            fields = line.split()
+            if len(fields) == NETSCAPE_COOKIE_FIELDS - 1:
+                fields.append("")  # cookie with an empty value
+            if len(fields) != NETSCAPE_COOKIE_FIELDS:
+                logging.warning("Skipping malformed YouTube cookie line")
+                continue
+        cookie_lines.append("\t".join(fields))
+
+    if not cookie_lines:
+        logging.warning(
+            "YOUTUBE_COOKIES is neither an existing file nor valid Netscape cookies, "
+            "downloading without cookies"
+        )
+        return None
+
+    # yt-dlp (via http.cookiejar.MozillaCookieJar) refuses files without this header.
+    return NETSCAPE_COOKIE_HEADER + "\n" + "\n".join(cookie_lines) + "\n"
+
+
 def download_video(url: str, work_dir: Path) -> tuple[Path, str | None]:
     output_template = str(work_dir / "%(extractor)s_%(id)s.%(ext)s")
 
@@ -147,7 +274,27 @@ def download_video(url: str, work_dir: Path) -> tuple[Path, str | None]:
 
         # Avoid weird filenames.
         "restrictfilenames": True,
+
+        # Route yt-dlp warnings/errors into our log (they're silenced by no_warnings otherwise),
+        # e.g. "The provided YouTube account cookies are no longer valid".
+        "logger": YT_DLP_LOGGER,
     }
+
+    if is_youtube_url(url):
+        cookies_text = load_youtube_cookies()
+        if cookies_text:
+            # yt-dlp writes the cookie jar back to `cookiefile` on exit, so each task gets
+            # its own copy: parallel workers don't clobber one file and the source may be read-only.
+            cookie_file = work_dir / "youtube_cookies.txt"
+            cookie_file.write_text(cookies_text, encoding="utf-8")
+            ydl_opts["cookiefile"] = str(cookie_file)
+            logging.info(
+                "Using YouTube cookies (%s cookies) for %s",
+                summarize_youtube_cookies(cookies_text)["count"],
+                url,
+            )
+        elif YOUTUBE_COOKIES.strip():
+            logging.warning("YOUTUBE_COOKIES is set but unusable, downloading %s without cookies", url)
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -317,6 +464,8 @@ async def stop_video_workers(application: Application) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("Set BOT_TOKEN environment variable")
+
+    log_youtube_cookies_status()
 
     app = (
         Application.builder()
