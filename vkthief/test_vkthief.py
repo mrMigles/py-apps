@@ -277,6 +277,131 @@ def test_download_video_without_cookies_env(monkeypatch, tmp_path):
     assert "cookiefile" not in captured["options"]
 
 
+FRESH_SIDCC = ".youtube.com\tTRUE\t/\tFALSE\t1893456000\tSIDCC\tfresh"
+
+
+@pytest.fixture(autouse=True)
+def reset_cookie_state(monkeypatch):
+    monkeypatch.setattr(vkthief, "_youtube_cookies_in_memory", None)
+    monkeypatch.setattr(vkthief, "_youtube_cookies_save_failed", False)
+
+
+def make_refresh_youtube_dl(page, new_cookies, captured):
+    """Fake YoutubeDL that 'gets' new cookies from YouTube and saves the jar on exit like yt-dlp."""
+
+    class FakeResponse:
+        def read(self):
+            return page.encode()
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured["options"] = dict(options)
+            self.cookie_file = vkthief.Path(options["cookiefile"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.cookie_file.write_text(
+                "# Netscape HTTP Cookie File\n" + new_cookies + "\n", encoding="utf-8"
+            )
+
+        def urlopen(self, url):
+            captured["url"] = url
+            return FakeResponse()
+
+    return FakeYoutubeDL
+
+
+def test_save_youtube_cookies_writes_back_to_file(monkeypatch, tmp_path):
+    source = tmp_path / "cookies.txt"
+    source.write_text(COOKIE_LINE + "\n", encoding="utf-8")
+    updated = tmp_path / "updated.txt"
+    updated.write_text(COOKIE_LINE + "\n" + FRESH_SIDCC + "\n", encoding="utf-8")
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", str(source))
+
+    assert vkthief.save_youtube_cookies(updated) is True
+    assert FRESH_SIDCC in source.read_text(encoding="utf-8")
+    # Nothing new the second time: the file isn't rewritten.
+    assert vkthief.save_youtube_cookies(updated) is False
+
+
+def test_save_youtube_cookies_keeps_login_when_youtube_logs_out(monkeypatch, tmp_path):
+    source = tmp_path / "cookies.txt"
+    source.write_text(COOKIE_LINE + "\n", encoding="utf-8")
+    updated = tmp_path / "updated.txt"
+    updated.write_text(FRESH_SIDCC + "\n", encoding="utf-8")  # SID is gone
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", str(source))
+
+    assert vkthief.save_youtube_cookies(updated) is False
+    assert source.read_text(encoding="utf-8") == COOKIE_LINE + "\n"
+
+
+def test_save_youtube_cookies_keeps_contents_in_memory(monkeypatch, tmp_path):
+    updated = tmp_path / "updated.txt"
+    updated.write_text(COOKIE_LINE + "\n" + FRESH_SIDCC + "\n", encoding="utf-8")
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", COOKIE_LINE)
+
+    assert vkthief.save_youtube_cookies(updated) is True
+    assert FRESH_SIDCC in vkthief.load_youtube_cookies()
+
+
+@pytest.mark.parametrize(
+    ("page", "expected", "saved"),
+    [
+        ('{"LOGGED_IN":true,"x":1}', True, True),
+        ('{"LOGGED_IN": false}', False, False),
+        ("<html>consent page</html>", None, True),
+    ],
+)
+def test_refresh_youtube_cookies(monkeypatch, tmp_path, page, expected, saved):
+    source = tmp_path / "cookies.txt"
+    source.write_text(COOKIE_LINE + "\n", encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", str(source))
+    monkeypatch.setattr(
+        vkthief, "YoutubeDL", make_refresh_youtube_dl(page, COOKIE_LINE + "\n" + FRESH_SIDCC, captured)
+    )
+
+    assert vkthief.refresh_youtube_cookies() is expected
+    assert captured["url"] == vkthief.YOUTUBE_HOME_URL
+    assert (FRESH_SIDCC in source.read_text(encoding="utf-8")) is saved
+
+
+def test_refresh_youtube_cookies_without_cookies(monkeypatch):
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", "")
+    assert vkthief.refresh_youtube_cookies() is None
+
+
+def test_download_video_saves_refreshed_cookies(monkeypatch, tmp_path):
+    source = tmp_path / "cookies.txt"
+    source.write_text(COOKIE_LINE + "\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    video_path = work_dir / "video.mp4"
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.cookie_file = vkthief.Path(options["cookiefile"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.cookie_file.write_text(COOKIE_LINE + "\n" + FRESH_SIDCC + "\n", encoding="utf-8")
+
+        def extract_info(self, url, download):
+            return {"requested_downloads": [{"filepath": str(video_path)}]}
+
+    monkeypatch.setattr(vkthief, "YOUTUBE_COOKIES", str(source))
+    monkeypatch.setattr(vkthief, "YoutubeDL", FakeYoutubeDL)
+
+    path, _ = vkthief.download_video("https://youtube.com/shorts/abc", work_dir)
+
+    assert path == video_path
+    assert FRESH_SIDCC in source.read_text(encoding="utf-8")
+
+
 @pytest.mark.asyncio
 async def test_handle_message_enqueues_supported_url():
     queue = __import__("asyncio").Queue()

@@ -8,6 +8,8 @@ Instagram Reels пока не поддерживается фактически,
 
 Требуется Python 3.10 или новее. Для некоторых роликов `yt-dlp` также нужен установленный в системе `ffmpeg`.
 
+Для YouTube `yt-dlp` нужен JavaScript-движок `deno` и скрипты `yt-dlp-ejs`. Оба ставятся из `requirements.txt` (пакеты `deno` и `yt-dlp[default]`). Без них YouTube, особенно с cookies, может отдавать только картинки или часть форматов. YouTube часто ломает загрузку, поэтому держите `yt-dlp` свежим: `pip install -U -r requirements.txt`.
+
 ```bash
 cd vkthief
 python -m venv .venv
@@ -44,6 +46,16 @@ Cookies передаются в `yt-dlp` только для ссылок YouTub
 - `YOUTUBE_COOKIES file not found` или `... neither an existing file nor valid Netscape cookies` — неверный путь или формат;
 - при скачивании с YouTube — `Using YouTube cookies (N cookies) for <ссылка>`;
 - `The provided YouTube account cookies are no longer valid` — предупреждение самого `yt-dlp`: YouTube отверг cookies, их нужно выгрузить заново.
+
+### Автообновление cookies
+
+- `YOUTUBE_COOKIES_REFRESH_HOURS` — как часто бот заходит на youtube.com с cookies, по умолчанию `24`. Значение `0` выключает автообновление. Первый заход бывает сразу при старте и заодно проверяет, что аккаунт залогинен.
+
+YouTube в ответах присылает свежие версии части cookies (`SIDCC`, `__Secure-*PSIDCC`, `YSC`, `VISITOR_*`). Бот записывает их обратно в файл из `YOUTUBE_COOKIES`, и после каждого успешного скачивания тоже. Если в `YOUTUBE_COOKIES` лежит само содержимое, а не путь, обновлённые cookies хранятся только в памяти до перезапуска. Поэтому лучше указывать путь к файлу, доступному на запись (в Docker — volume, а не read-only secret).
+
+Если YouTube в ответе «разлогинил» сессию, бот не перезаписывает файл: старые рабочие cookies сохраняются.
+
+Это продлевает жизнь cookies, но не бесконечно. Основную сессию Google (`SID`, `__Secure-*PSIDTS`) продлевает только настоящий браузер. Если вы выйдете из аккаунта, смените пароль или Google сочтёт вход подозрительным, cookies всё равно придётся выгрузить заново. В логе это видно по строкам `YouTube cookies refresh: the account is NOT signed in` или `cookies are no longer valid`.
 
 `yt-dlp` при завершении перезаписывает файл cookies, поэтому бот для каждой задачи делает отдельную копию во временной папке. Так параллельные воркеры не портят один файл, а исходный файл может быть доступен только для чтения.
 
